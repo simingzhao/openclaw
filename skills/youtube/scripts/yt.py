@@ -62,11 +62,19 @@ def cmd_search(args):
 
 # ── transcript ──────────────────────────────────────────────────
 def _try_transcript_api(video_id, langs):
-    """Try youtube_transcript_api first."""
+    """Try youtube_transcript_api first (with optional proxy)."""
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
         from youtube_transcript_api.formatters import TextFormatter
-        ytt = YouTubeTranscriptApi()
+
+        proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+        proxy_config = None
+        if proxy_url:
+            from youtube_transcript_api.proxies import GenericProxyConfig
+            proxy_config = GenericProxyConfig(https_url=proxy_url)
+            print(f"[transcript-api] Using proxy: {proxy_url}", file=sys.stderr)
+
+        ytt = YouTubeTranscriptApi(proxy_config=proxy_config)
         transcript = ytt.fetch(video_id, languages=langs)
         return TextFormatter().format_transcript(transcript)
     except Exception as e:
