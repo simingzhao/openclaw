@@ -70,9 +70,49 @@ python3 scripts/yt.py info "VIDEO_ID"
 2. Search in channel: `python3 scripts/yt.py search "query" --channel CHANNEL_ID`
 3. Transcript → summarize
 
+## Workflow: Long Video Summary (Map-Reduce)
+
+For videos longer than 30 minutes with very long transcripts, use the map-reduce approach:
+
+```bash
+# One-command solution
+./scripts/summarize_long.sh "VIDEO_URL_OR_ID" [output_dir]
+
+# Example
+./scripts/summarize_long.sh "https://youtu.be/SGEaHsul_y4" ~/Desktop/Openclaw_vault/YouTube_Transcripts
+```
+
+**How it works:**
+
+1. **Fetch**: Get video info and full transcript via Apify
+2. **Split**: Divide transcript into ~20KB chunks
+3. **Map**: Extract 8-10 key points from each chunk (parallel Gemini calls)
+4. **Reduce**: Merge all points into comprehensive 2000+ word summary with:
+   - 视频概述
+   - 核心理念（含原文引用）
+   - 具体配置与工具（表格）
+   - 方法论与技巧
+   - 金句摘录（中英对照）
+   - 案例故事
+   - 行动建议
+
+**When to use:**
+
+- Video duration > 30 minutes
+- Transcript > 50KB
+- Need detailed, structured summary with quotes
+
+**Output files:**
+
+- `{video_id}_full.md` - Final comprehensive summary
+- `transcript_{video_id}.txt` - Raw transcript
+- `all_points_{video_id}.txt` - Extracted points from all chunks
+
 ## Notes
 
 - Transcript may fail if video has no captions or IP is blocked by YouTube.
 - If all transcript methods fail, inform the user and suggest trying from a different network.
 - Always use Gemini CLI for the final summary — never summarize inline.
 - Search API cost: 100 units per call; use sparingly.
+- For long videos (1h+), prefer `summarize_long.sh` over direct `summarize` command.
+- Map-Reduce handles transcripts of any length without timeout issues.
