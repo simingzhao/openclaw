@@ -22,17 +22,14 @@ Web search powered by Gemini 3 Flash with Google Search grounding. Returns AI-sy
 # Set skill directory
 SKILL_DIR="/Users/simingzhao/Desktop/openclaw/skills/gemini-search"
 
-# Basic search
-GEMINI_API_KEY="AIzaSyAAWRmhPvDxZErPgafa9KDS3p4jE07Mz8k" \
-  $SKILL_DIR/.venv/bin/python3 $SKILL_DIR/scripts/search.py "query"
+# Basic search (requires GEMINI_API_KEY env var)
+$SKILL_DIR/.venv/bin/python3 $SKILL_DIR/scripts/search.py "query"
 
 # With high thinking (for complex research)
-GEMINI_API_KEY="AIzaSyAAWRmhPvDxZErPgafa9KDS3p4jE07Mz8k" \
-  $SKILL_DIR/.venv/bin/python3 $SKILL_DIR/scripts/search.py "query" --thinking high
+$SKILL_DIR/.venv/bin/python3 $SKILL_DIR/scripts/search.py "query" --thinking high
 
 # With URL context
-GEMINI_API_KEY="AIzaSyAAWRmhPvDxZErPgafa9KDS3p4jE07Mz8k" \
-  $SKILL_DIR/.venv/bin/python3 $SKILL_DIR/scripts/search.py "summarize this" --url https://example.com/article
+$SKILL_DIR/.venv/bin/python3 $SKILL_DIR/scripts/search.py "summarize this" --url https://example.com/article
 ```
 
 ## Options
