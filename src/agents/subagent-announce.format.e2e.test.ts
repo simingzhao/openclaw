@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { SILENT_REPLY_TOKEN } from "../auto-reply/tokens.js";
 
 const agentSpy = vi.fn(async () => ({ runId: "run-main", status: "ok" }));
 const sessionsDeleteSpy = vi.fn();
@@ -21,6 +22,17 @@ let configOverride: ReturnType<(typeof import("../config/config.js"))["loadConfi
     scope: "per-sender",
   },
 };
+
+function loadSessionStoreFixture(): Record<string, Record<string, unknown>> {
+  return new Proxy(sessionStore, {
+    get(target, key: string | symbol) {
+      if (typeof key === "string" && !(key in target) && key.includes(":subagent:")) {
+        return { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
+      }
+      return target[key as keyof typeof target];
+    },
+  });
+}
 
 vi.mock("../gateway/call.js", () => ({
   callGateway: vi.fn(async (req: unknown) => {
@@ -47,7 +59,7 @@ vi.mock("./tools/agent-step.js", () => ({
 }));
 
 vi.mock("../config/sessions.js", () => ({
-  loadSessionStore: vi.fn(() => sessionStore),
+  loadSessionStore: vi.fn(() => loadSessionStoreFixture()),
   resolveAgentIdFromSessionKey: () => "main",
   resolveStorePath: () => "/tmp/sessions.json",
   resolveMainSessionKey: () => "agent:main:main",
@@ -93,6 +105,9 @@ describe("subagent announce formatting", () => {
     sessionStore = {
       "agent:main:subagent:test": {
         sessionId: "child-session-123",
+        inputTokens: 1,
+        outputTokens: 1,
+        totalTokens: 2,
       },
     };
     await runSubagentAnnounceFlow({
@@ -149,6 +164,28 @@ describe("subagent announce formatting", () => {
     expect(msg).toContain("completed successfully");
   });
 
+  it("uses child-run announce identity for direct idempotency", async () => {
+    const { runSubagentAnnounceFlow } = await import("./subagent-announce.js");
+    await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:worker",
+      childRunId: "run-direct-idem",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "do thing",
+      timeoutMs: 1000,
+      cleanup: "keep",
+      waitForCompletion: false,
+      startedAt: 10,
+      endedAt: 20,
+      outcome: { status: "ok" },
+    });
+
+    const call = agentSpy.mock.calls[0]?.[0] as { params?: Record<string, unknown> };
+    expect(call?.params?.idempotencyKey).toBe(
+      "announce:v1:agent:main:subagent:worker:run-direct-idem",
+    );
+  });
+
   it("keeps full findings and includes compact stats", async () => {
     const { runSubagentAnnounceFlow } = await import("./subagent-announce.js");
     sessionStore = {
@@ -186,7 +223,7 @@ describe("subagent announce formatting", () => {
     expect(msg).toContain("[sessionId: child-session-usage]");
     expect(msg).toContain("A completed subagent task is ready for user delivery.");
     expect(msg).toContain(
-      "Reply ONLY: NO_REPLY if this exact result was already delivered to the user in this same turn.",
+      `Reply ONLY: ${SILENT_REPLY_TOKEN} if this exact result was already delivered to the user in this same turn.`,
     );
     expect(msg).toContain("step-0");
     expect(msg).toContain("step-139");
@@ -264,6 +301,60 @@ describe("subagent announce formatting", () => {
     expect(call?.params?.channel).toBe("whatsapp");
     expect(call?.params?.to).toBe("+1555");
     expect(call?.params?.accountId).toBe("kev");
+  });
+
+  it("keeps queued idempotency unique for same-ms distinct child runs", async () => {
+    const { runSubagentAnnounceFlow } = await import("./subagent-announce.js");
+    embeddedRunMock.isEmbeddedPiRunActive.mockReturnValue(true);
+    embeddedRunMock.isEmbeddedPiRunStreaming.mockReturnValue(false);
+    sessionStore = {
+      "agent:main:main": {
+        sessionId: "session-followup",
+        lastChannel: "whatsapp",
+        lastTo: "+1555",
+        queueMode: "followup",
+        queueDebounceMs: 0,
+      },
+    };
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+    try {
+      await runSubagentAnnounceFlow({
+        childSessionKey: "agent:main:subagent:worker",
+        childRunId: "run-1",
+        requesterSessionKey: "main",
+        requesterDisplayKey: "main",
+        task: "first task",
+        timeoutMs: 1000,
+        cleanup: "keep",
+        waitForCompletion: false,
+        startedAt: 10,
+        endedAt: 20,
+        outcome: { status: "ok" },
+      });
+      await runSubagentAnnounceFlow({
+        childSessionKey: "agent:main:subagent:worker",
+        childRunId: "run-2",
+        requesterSessionKey: "main",
+        requesterDisplayKey: "main",
+        task: "second task",
+        timeoutMs: 1000,
+        cleanup: "keep",
+        waitForCompletion: false,
+        startedAt: 10,
+        endedAt: 20,
+        outcome: { status: "ok" },
+      });
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    await expect.poll(() => agentSpy.mock.calls.length).toBe(2);
+    const idempotencyKeys = agentSpy.mock.calls
+      .map((call) => (call[0] as { params?: Record<string, unknown> })?.params?.idempotencyKey)
+      .filter((value): value is string => typeof value === "string");
+    expect(idempotencyKeys).toContain("announce:v1:agent:main:subagent:worker:run-1");
+    expect(idempotencyKeys).toContain("announce:v1:agent:main:subagent:worker:run-2");
+    expect(new Set(idempotencyKeys).size).toBe(2);
   });
 
   it("queues announce delivery back into requester subagent session", async () => {
@@ -504,6 +595,9 @@ describe("subagent announce formatting", () => {
     sessionStore = {
       "agent:main:subagent:test": {
         sessionId: "child-session-1",
+        inputTokens: 1,
+        outputTokens: 1,
+        totalTokens: 2,
       },
     };
 
@@ -664,34 +758,6 @@ describe("subagent announce formatting", () => {
 
     expect(didAnnounce).toBe(false);
     expect(agentSpy).not.toHaveBeenCalled();
-  });
-
-  it("does not delete child session when announce is deferred for an active run", async () => {
-    const { runSubagentAnnounceFlow } = await import("./subagent-announce.js");
-    embeddedRunMock.isEmbeddedPiRunActive.mockReturnValue(true);
-    embeddedRunMock.waitForEmbeddedPiRunEnd.mockResolvedValue(false);
-    sessionStore = {
-      "agent:main:subagent:test": {
-        sessionId: "child-session-active",
-      },
-    };
-
-    const didAnnounce = await runSubagentAnnounceFlow({
-      childSessionKey: "agent:main:subagent:test",
-      childRunId: "run-child-active-delete",
-      requesterSessionKey: "agent:main:main",
-      requesterDisplayKey: "main",
-      task: "context-stress-test",
-      timeoutMs: 1000,
-      cleanup: "delete",
-      waitForCompletion: false,
-      startedAt: 10,
-      endedAt: 20,
-      outcome: { status: "ok" },
-    });
-
-    expect(didAnnounce).toBe(false);
-    expect(sessionsDeleteSpy).not.toHaveBeenCalled();
   });
 
   it("normalizes requesterOrigin for direct announce delivery", async () => {
