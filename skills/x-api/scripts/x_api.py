@@ -352,6 +352,73 @@ def cmd_follow(args):
         output(data)
 
 
+def cmd_following(args):
+    """Get list of accounts a user is following."""
+    session = get_oauth1_session()
+    user_id = resolve_username_to_id(session, args.username)
+    params = {
+        "max_results": args.max_results,
+        "user.fields": USER_FIELDS,
+    }
+    all_users = []
+    pagination_token = None
+    
+    while True:
+        if pagination_token:
+            params["pagination_token"] = pagination_token
+        data = api_get(session, f"/users/{user_id}/following", params=params)
+        users = data.get("data", [])
+        all_users.extend(users)
+        
+        # Check for more pages
+        meta = data.get("meta", {})
+        pagination_token = meta.get("next_token")
+        
+        # Stop if no more pages or reached limit
+        if not pagination_token or len(all_users) >= args.max_results:
+            break
+    
+    # Trim to max_results
+    all_users = all_users[:args.max_results]
+    
+    result = {"data": all_users, "meta": {"result_count": len(all_users)}}
+    
+    if args.human:
+        format_following(result, args.min_followers)
+    else:
+        # Filter by min_followers if specified
+        if args.min_followers:
+            filtered = [u for u in all_users 
+                       if u.get("public_metrics", {}).get("followers_count", 0) >= args.min_followers]
+            result = {"data": filtered, "meta": {"result_count": len(filtered)}}
+        output(result)
+
+
+def format_following(data, min_followers=None):
+    """Human-readable following list."""
+    users = data.get("data", [])
+    if not users:
+        print("No following found.")
+        return
+    
+    # Sort by followers count
+    users_sorted = sorted(users, 
+                         key=lambda u: u.get("public_metrics", {}).get("followers_count", 0), 
+                         reverse=True)
+    
+    # Filter by min_followers if specified
+    if min_followers:
+        users_sorted = [u for u in users_sorted 
+                       if u.get("public_metrics", {}).get("followers_count", 0) >= min_followers]
+    
+    print(f"Following ({len(users_sorted)} accounts):\n")
+    for u in users_sorted:
+        pm = u.get("public_metrics", {})
+        followers = pm.get("followers_count", 0)
+        print(f"  @{u.get('username', '?'):20} | {followers:>10,} followers | {u.get('name', '')}")
+    print()
+
+
 def cmd_delete(args):
     session = get_oauth1_session()
     data = api_delete(session, f"/tweets/{args.tweet_id}")
@@ -433,6 +500,13 @@ def main():
     sub = subparsers.add_parser("follow", help="Follow a user")
     sub.add_argument("username", help="Username to follow (with or without @)")
     sub.set_defaults(func=cmd_follow)
+
+    # following
+    sub = subparsers.add_parser("following", help="Get list of accounts a user is following")
+    sub.add_argument("username", help="Username (with or without @)")
+    sub.add_argument("--max-results", type=int, default=100, help="Max results (default: 100)")
+    sub.add_argument("--min-followers", type=int, help="Filter by minimum follower count")
+    sub.set_defaults(func=cmd_following)
 
     # delete
     sub = subparsers.add_parser("delete", help="Delete a post")
