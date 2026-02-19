@@ -84,7 +84,26 @@ def get_youtube_service():
     if not key:
         print("Error: YOUTUBE_API_KEY not set", file=sys.stderr)
         sys.exit(1)
-    return build("youtube", "v3", developerKey=key)
+    # Support HTTPS_PROXY / HTTP_PROXY for httplib2
+    proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    http = None
+    if proxy_url:
+        try:
+            import httplib2
+            from urllib.parse import urlparse
+            p = urlparse(proxy_url)
+            proxy_info = httplib2.ProxyInfo(
+                httplib2.socks.PROXY_TYPE_HTTP,
+                p.hostname, p.port or 7890
+            )
+            http = httplib2.Http(proxy_info=proxy_info)
+            print(f"[yt-api] Using proxy: {proxy_url}", file=sys.stderr)
+        except Exception as e:
+            print(f"[yt-api] Proxy setup failed: {e}, continuing without proxy", file=sys.stderr)
+    kwargs = {"developerKey": key}
+    if http:
+        kwargs["http"] = http
+    return build("youtube", "v3", **kwargs)
 
 
 def resolve_channel_id(handle: str, config: dict | None = None) -> str | None:

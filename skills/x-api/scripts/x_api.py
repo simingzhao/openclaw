@@ -419,6 +419,80 @@ def format_following(data, min_followers=None):
     print()
 
 
+def cmd_thread(args):
+    """Fetch a full thread/conversation by searching for conversation_id."""
+    session = get_oauth1_session()
+
+    # First get the tweet to find its conversation_id and author
+    tweet_data = api_get(session, f"/tweets/{args.tweet_id}", params={
+        "tweet.fields": TWEET_FIELDS,
+        "expansions": "author_id",
+        "user.fields": "id,username",
+    })
+    tweet = tweet_data.get("data", {})
+    conv_id = tweet.get("conversation_id", args.tweet_id)
+    author_id = tweet.get("author_id", "")
+
+    # Resolve author username from includes
+    author_username = author_id
+    for u in tweet_data.get("includes", {}).get("users", []):
+        if u["id"] == author_id:
+            author_username = u.get("username", author_id)
+            break
+
+    # Search for all tweets in this conversation from the same author
+    query = f"conversation_id:{conv_id} from:{author_username} -is:retweet"
+    params = {
+        "query": query,
+        "max_results": args.max_results,
+        "tweet.fields": TWEET_FIELDS,
+        "expansions": "author_id",
+        "user.fields": "id,username",
+        "sort_order": "recency",
+    }
+    search_data = api_get(session, "/tweets/search/recent", params=params)
+    thread_tweets = search_data.get("data", [])
+
+    # Include the original conversation starter if not in results
+    existing_ids = {t["id"] for t in thread_tweets}
+    if conv_id not in existing_ids:
+        # Fetch the conversation starter
+        starter_data = api_get(session, f"/tweets/{conv_id}", params={
+            "tweet.fields": TWEET_FIELDS,
+            "expansions": "author_id",
+            "user.fields": "id,username",
+        })
+        starter = starter_data.get("data")
+        if starter:
+            thread_tweets.append(starter)
+
+    # Sort by ID (chronological)
+    thread_tweets.sort(key=lambda t: int(t.get("id", "0")))
+
+    result = {
+        "data": thread_tweets,
+        "meta": {
+            "conversation_id": conv_id,
+            "author": author_username,
+            "thread_length": len(thread_tweets),
+        },
+        "includes": search_data.get("includes", tweet_data.get("includes", {})),
+    }
+
+    if args.human:
+        print(f"🧵 Thread by @{author_username} ({len(thread_tweets)} tweets)")
+        print(f"   conversation_id: {conv_id}\n")
+        users = {}
+        for u in result.get("includes", {}).get("users", []):
+            users[u["id"]] = u.get("username", u["id"])
+        for i, t in enumerate(thread_tweets, 1):
+            t["username"] = users.get(t.get("author_id", ""), author_username)
+            print(f"  [{i}/{len(thread_tweets)}]")
+            format_tweet(t)
+    else:
+        output(result)
+
+
 def cmd_delete(args):
     session = get_oauth1_session()
     data = api_delete(session, f"/tweets/{args.tweet_id}")
@@ -507,6 +581,12 @@ def main():
     sub.add_argument("--max-results", type=int, default=100, help="Max results (default: 100)")
     sub.add_argument("--min-followers", type=int, help="Filter by minimum follower count")
     sub.set_defaults(func=cmd_following)
+
+    # thread
+    sub = subparsers.add_parser("thread", help="Fetch a full thread by any tweet ID in it")
+    sub.add_argument("tweet_id", help="Any tweet ID in the thread")
+    sub.add_argument("--max-results", type=int, default=100, help="Max tweets to fetch (default: 100)")
+    sub.set_defaults(func=cmd_thread)
 
     # delete
     sub = subparsers.add_parser("delete", help="Delete a post")
