@@ -1,0 +1,907 @@
+#!/usr/bin/env python3
+"""
+batch_gen.py — 探子的批量内容生成器
+
+独立脚本，用 Gemini 批量生成小红书帖子，不走 Opus。
+
+两种模式：
+  1. from-plan   从 topic.json 的 posts 规划中批量生成
+  2. from-sense  从 sense/latest.json 的选题建议生成
+
+输出 content.json 到 content/drafts/{topic_id}/{post_id}_{slug}/
+
+用法：
+  $VENV batch_gen.py from-plan --topic claude-monetization --posts 01,02,03
+  $VENV batch_gen.py from-plan --topic vibe-coding --count 5    # 自动选前5个planned
+  $VENV batch_gen.py from-plan --all --count 10                 # 跨topic自动选10个
+  $VENV batch_gen.py from-sense                                 # 从最新Sense选题生成
+  $VENV batch_gen.py from-sense --count 3                       # 只生成前3个
+  $VENV batch_gen.py from-sense --input /path/to/latest.json
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    print("❌ 需要 google-genai: pip install google-genai", file=sys.stderr)
+    sys.exit(1)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Config
+# ═══════════════════════════════════════════════════════════════
+
+MODEL_PRIMARY = os.environ.get("BATCH_MODEL", "gemini-3.1-pro-preview")
+MODEL_FALLBACK = "gemini-3-flash-preview"
+
+WORKSPACE = Path(os.environ.get(
+    "REDNOTE_WORKSPACE",
+    os.path.expanduser("~/.openclaw/workspace-rednote-ops"),
+))
+
+DRAFTS_DIR = WORKSPACE / "content" / "drafts"
+SENSE_LATEST = WORKSPACE / "sense" / "latest.json"
+
+OBSIDIAN_VAULT = Path(os.path.expanduser(
+    "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/OpenClaw_Vault"
+))
+OBSIDIAN_REDNOTE = OBSIDIAN_VAULT / "Rednote"
+
+TODAY = datetime.now().strftime("%Y-%m-%d")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 金牌写手 System Prompt
+# ═══════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════
+# 共享基础 prompt 片段
+# ═══════════════════════════════════════════════════════════════
+
+_BASE_IDENTITY = """你是「探子」的金牌小红书写手。
+
+## 账号定位
+- 平台：小红书
+- 领域：AI赚钱/超级个体 — 教普通人怎么通过AI搞钱
+- 人设：有洞察力的AI实战者，懂技术说人话，自己就在用AI搞事
+- 调性：接地气、有判断力、偶尔毒舌但不刻薄
+
+## 通用红线
+❌ 严禁：
+- 纯bullet point罗列（像PPT大纲）
+- 信息搬运无观点
+- 涉及政治敏感话题
+- 提中国用户不认识的外国人名（只展示核心观点和数据）
+
+## 通用风格
+- 开头第一句就要抓人（数据/反常识/故事开头）
+- 用emoji分隔段落，但不滥用（每2-3段一个）
+- 口语化，像朋友在聊天分享
+- 说人话，不用"赋能""矩阵""生态"这类空话
+- 有自己的判断："这个靠谱""那个是坑"
+
+## 通用规则
+- post_title ≤ 20字（硬限制！）
+- post_body 600-950字（不能超950！）
+- 开头不要"大家好"之类的废话，直接进主题
+- 严格输出 JSON，不要输出任何额外文本
+- 多篇用 JSON array：[{...}, {...}]
+- **JSON格式关键**：post_body 中的换行必须写成 \\n（转义），不能用真实换行！否则JSON会解析失败。cover_title 同理。"""
+
+_COVER_RULES = """
+## 封面文案规则（cover_title）
+- 用 \\n 控制换行，通常3行
+- 每行≤12字，总计≤36字"""
+
+# ═══════════════════════════════════════════════════════════════
+# practical 模式 prompt（实操/教程/案例拆解）
+# ═══════════════════════════════════════════════════════════════
+
+PROMPT_PRACTICAL = _BASE_IDENTITY + """
+
+## 模式：实操干货（practical）
+
+### 内容标准
+✅ 必须有：
+- 可执行的具体步骤（step-by-step）
+- 真实案例或数据（不编造）
+- 读完能直接动手的行动指引
+
+❌ 额外禁止：
+- 没有操作细节的工具推荐
+
+### 钩子策略
+- 正文给80%干货，故意留20%缺口（最核心的模板/SOP/清单不放）
+- 末尾引导评论指定关键词 → 获取完整PDF
+- 格式：👇 评论区扣【关键词】，我私信你「PDF名称」含具体内容列表
+
+### 输出字段
+```json
+{
+  "topic_id": "xxx",
+  "post_id": "xx",
+  "content_mode": "practical",
+  "style_id": "hook-cover",
+  "cover_title": "封面大字\\n每行一个钩子\\n含具体数字",
+  "cover_subtitle": "",
+  "post_title": "帖子标题（≤20字）",
+  "post_body": "完整正文（600-950字）",
+  "tags": ["AI", "标签2", "标签3", "标签4", "标签5"],
+  "hook_keyword": "评论区关键词",
+  "pdf_slug": "topic_postid_slug",
+  "pdf_outline": ["PDF章节1", "PDF章节2"],
+  "status": "draft",
+  "created_at": "YYYY-MM-DD"
+}
+```
+""" + _COVER_RULES + """
+- 公式：[反常识/身份] + [具体工具/方法] + [具体数字结果]
+- 例："文科生零基础\\n用Cursor写APP\\n3周月入$2000"
+
+### 标题公式
+- 包含具体数字或结果
+- 制造好奇心缺口
+- 可用身份标签（文科生/宝妈/大学生等）
+
+### 正文结构
+- 每个步骤要有具体的操作细节，不是笼统的方向
+- 结尾必须有钩子引导"""
+
+# ═══════════════════════════════════════════════════════════════
+# news 模式 prompt（资讯解读/趋势分析/观点输出）
+# ═══════════════════════════════════════════════════════════════
+
+PROMPT_NEWS = _BASE_IDENTITY + """
+
+## 模式：资讯解读（news）
+
+### 内容标准
+✅ 必须有：
+- 事件本身的清晰描述（发生了什么）
+- 探子的独立判断（这意味着什么）
+- 对普通人的影响分析（跟你有什么关系）
+- 至少1个具体数据点
+
+❌ 额外禁止：
+- 纯转述无观点（"XXX发布了YYY"不够，要有"所以呢？"）
+- 贩卖焦虑（"不学就淘汰"之类）
+
+### 结尾策略（不用钩子PDF模式）
+资讯类结尾用以下任一方式：
+- 抛出开放问题引发讨论："你觉得这对普通人是好事还是坏事？👇"
+- 关注引导："关注我，第一时间拆解AI圈大事"
+- 互动引导："你最想看我拆解哪个方向？评论区告诉我"
+
+### 输出字段
+```json
+{
+  "topic_id": "xxx",
+  "post_id": "xx",
+  "content_mode": "news",
+  "style_id": "hook-cover",
+  "cover_title": "封面大字\\n核心信息\\n关键数据或判断",
+  "cover_subtitle": "",
+  "post_title": "帖子标题（≤20字）",
+  "post_body": "完整正文（600-950字）",
+  "tags": ["AI", "标签2", "标签3", "标签4", "标签5"],
+  "cta_type": "discuss|follow|vote",
+  "cta_question": "结尾引导的具体问题",
+  "status": "draft",
+  "created_at": "YYYY-MM-DD"
+}
+```
+
+注意：news模式**没有** hook_keyword / pdf_slug / pdf_outline 字段。
+""" + _COVER_RULES + """
+- 公式：[事件核心] + [关键数据/时间] + [探子判断]
+- 例："AI学会操作电脑了\\n这次是真的\\n普通人该怕还是该笑？"
+
+### 标题公式
+- 点明事件 + 加入判断或悬念
+- 可以用疑问句制造讨论欲
+- 例："AI自己会用电脑了，程序员慌不慌？"
+
+### 正文结构
+建议按三段式：
+1. **发生了什么**（2-3段，简洁交代事件+关键数据）
+2. **探子怎么看**（2-3段，给出独立判断，敢说"这个被高估了"或"这才是真正的拐点"）
+3. **跟你有什么关系**（1-2段，落到普通人/创作者/超级个体的实际影响+行动建议）"""
+
+# prompt 选择器
+SYSTEM_PROMPTS = {
+    "practical": PROMPT_PRACTICAL,
+    "news": PROMPT_NEWS,
+}
+
+def get_system_prompt(mode: str) -> str:
+    return SYSTEM_PROMPTS.get(mode, PROMPT_PRACTICAL)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Gemini 调用
+# ═══════════════════════════════════════════════════════════════
+
+def call_gemini(user_prompt: str, batch_size: int = 1, content_mode: str = "practical") -> str | None:
+    """调用 Gemini 生成内容，返回原始文本。"""
+    client = genai.Client()
+    system_prompt = get_system_prompt(content_mode)
+
+    # 按篇数动态调整 max_output_tokens
+    # 单篇中文约 1000 字 ≈ ~2000 tokens，加上JSON结构开销给 5000
+    tokens_per_post = 5000
+    max_tokens = min(tokens_per_post * max(batch_size, 1), 65536)
+
+    for model in [MODEL_PRIMARY, MODEL_FALLBACK]:
+        try:
+            print(f"  🤖 模型: {model} | mode: {content_mode}", file=sys.stderr)
+            response = client.models.generate_content(
+                model=model,
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.7,
+                    max_output_tokens=max_tokens,
+                ),
+            )
+            if response and response.text:
+                # 检查是否被截断
+                finish = getattr(response.candidates[0], 'finish_reason', None) if response.candidates else None
+                text_len = len(response.text)
+                print(f"  ✅ 生成完成 ({model}) | {text_len}字 | finish={finish}", file=sys.stderr)
+                return response.text
+        except Exception as e:
+            if any(k in str(e) for k in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
+                print(f"  ⚠️ {model} 不可用: {e}", file=sys.stderr)
+                continue
+            print(f"  ❌ {model} 错误: {e}", file=sys.stderr)
+            continue
+
+    print("❌ 所有模型都不可用", file=sys.stderr)
+    return None
+
+
+def _fix_json_newlines(raw: str) -> str:
+    """修复 Gemini 在 JSON string value 中插入的真实换行。
+    
+    逐字符扫描，在 JSON 字符串内部（双引号之间）把 \\n → \\\\n。
+    """
+    result = []
+    in_string = False
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch == '\\' and in_string and i + 1 < len(raw):
+            # 保留转义序列原样
+            result.append(ch)
+            result.append(raw[i + 1])
+            i += 2
+            continue
+        if ch == '"':
+            in_string = not in_string
+            result.append(ch)
+        elif ch == '\n' and in_string:
+            result.append('\\n')
+        else:
+            result.append(ch)
+        i += 1
+    return ''.join(result)
+
+
+def parse_json_response(text: str) -> list[dict]:
+    """从 Gemini 响应中解析 JSON，兼容单篇和多篇。"""
+    raw = text.strip()
+    if "```json" in raw:
+        raw = raw.split("```json", 1)[1]
+        raw = raw.split("```", 1)[0]
+    elif "```" in raw:
+        raw = raw.split("```", 1)[1]
+        raw = raw.split("```", 1)[0]
+    raw = raw.strip()
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # Gemini常在JSON string value中插入真实换行，需要修复
+        fixed = _fix_json_newlines(raw)
+        try:
+            data = json.loads(fixed)
+            print(f"  🔧 JSON自动修复成功（裸换行→转义）", file=sys.stderr)
+        except json.JSONDecodeError as e2:
+            print(f"❌ JSON解析失败: {e2}", file=sys.stderr)
+            print(f"  片段: {text[:500]}", file=sys.stderr)
+            return []
+
+    if isinstance(data, list):
+        return data
+    elif isinstance(data, dict):
+        return [data]
+    else:
+        print(f"❌ 意外的JSON类型: {type(data)}", file=sys.stderr)
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════
+# 质检
+# ═══════════════════════════════════════════════════════════════
+
+def validate_post(post: dict) -> list[str]:
+    """校验单篇帖子，返回错误列表（空=通过）。"""
+    errors = []
+    title = post.get("post_title", "")
+    body = post.get("post_body", "")
+    cover = post.get("cover_title", "")
+    tags = post.get("tags", [])
+    mode = post.get("content_mode", "practical")
+
+    if not title:
+        errors.append("缺少 post_title")
+    elif len(title) > 20:
+        errors.append(f"post_title 过长: {len(title)}字 (限20)")
+
+    if not body:
+        errors.append("缺少 post_body")
+    elif len(body) < 300:
+        errors.append(f"post_body 过短: {len(body)}字 (需≥300)")
+    elif len(body) > 950:
+        errors.append(f"post_body 过长: {len(body)}字 (限950)")
+
+    if not cover:
+        errors.append("缺少 cover_title")
+
+    if not tags or len(tags) < 2:
+        errors.append("tags 太少 (需≥2)")
+
+    # practical 模式必须有钩子和PDF
+    if mode == "practical":
+        if not post.get("hook_keyword"):
+            errors.append("缺少 hook_keyword")
+        if not post.get("pdf_outline"):
+            errors.append("缺少 pdf_outline")
+    # news 模式必须有 cta
+    elif mode == "news":
+        if not post.get("cta_type") and not post.get("cta_question"):
+            errors.append("缺少 cta_type 或 cta_question")
+
+    return errors
+
+
+# ═══════════════════════════════════════════════════════════════
+# 保存
+# ═══════════════════════════════════════════════════════════════
+
+def save_draft(post: dict) -> Path | None:
+    """保存单篇 content.json 到 drafts 目录。"""
+    topic_id = post.get("topic_id", "unknown")
+    post_id = post.get("post_id", "xx")
+    title = post.get("post_title", "untitled")
+
+    # 生成 slug: 取标题前几个关键字
+    slug = _make_slug(title)
+    dir_name = f"{post_id}_{slug}"
+    draft_dir = DRAFTS_DIR / topic_id / dir_name
+
+    # 如果已存在，不覆盖（除非 status 是 planned）
+    content_path = draft_dir / "content.json"
+    if content_path.exists():
+        existing = json.loads(content_path.read_text(encoding="utf-8"))
+        if existing.get("status") not in ("planned", None):
+            print(f"  ⚠️ 跳过 {dir_name}: 已存在 status={existing.get('status')}", file=sys.stderr)
+            return None
+
+    # 补充元数据
+    post.setdefault("status", "draft")
+    post.setdefault("created_at", TODAY)
+    post.setdefault("published_at", None)
+    post.setdefault("published_id", None)
+    post.setdefault("style_id", "hook-cover")
+
+    draft_dir.mkdir(parents=True, exist_ok=True)
+    with open(content_path, "w", encoding="utf-8") as f:
+        json.dump(post, f, ensure_ascii=False, indent=2)
+
+    # 同步到 Obsidian
+    _sync_to_obsidian(post, dir_name)
+
+    return content_path
+
+
+def _sync_to_obsidian(post: dict, dir_name: str):
+    """把 draft 同步为 Obsidian Markdown，手机可读。"""
+    if not OBSIDIAN_REDNOTE.exists():
+        return  # Obsidian vault 不在本机，跳过
+
+    topic_id = post.get("topic_id", "unknown")
+    post_id = post.get("post_id", "xx")
+    title = post.get("post_title", "untitled")
+    body = post.get("post_body", "")
+    cover = post.get("cover_title", "").replace("\\n", "\n")
+    tags_list = post.get("tags", [])
+    status = post.get("status", "draft")
+    mode = post.get("content_mode", "practical")
+    hook = post.get("hook_keyword", "")
+    cta = post.get("cta_question", "")
+
+    # frontmatter
+    tags_yaml = ", ".join(f'"{t}"' for t in tags_list)
+    lines = [
+        "---",
+        f"topic: {topic_id}",
+        f"post_id: {post_id}",
+        f"status: {status}",
+        f"mode: {mode}",
+        f"tags: [{tags_yaml}]",
+        f"created: {post.get('created_at', TODAY)}",
+        "---",
+        "",
+        f"# {title}",
+        "",
+        "## 封面文案",
+        f"```",
+        cover,
+        f"```",
+        "",
+        "## 正文",
+        "",
+        body,
+        "",
+    ]
+
+    if mode == "practical" and hook:
+        lines.append(f"## 钩子")
+        lines.append(f"关键词：**{hook}**")
+        pdf_outline = post.get("pdf_outline", [])
+        if pdf_outline:
+            lines.append(f"PDF: {post.get('pdf_slug', '')}")
+            for item in pdf_outline:
+                lines.append(f"- {item}")
+        lines.append("")
+    elif mode == "news" and cta:
+        lines.append(f"## CTA")
+        lines.append(f"类型：{post.get('cta_type', '?')}")
+        lines.append(f"问题：{cta}")
+        lines.append("")
+
+    md_content = "\n".join(lines)
+
+    # 写入 Obsidian: Rednote/drafts/{topic_id}_{post_id}.md
+    ob_dir = OBSIDIAN_REDNOTE / "drafts"
+    ob_dir.mkdir(parents=True, exist_ok=True)
+    ob_path = ob_dir / f"{topic_id}_{post_id}.md"
+    ob_path.write_text(md_content, encoding="utf-8")
+
+
+def _make_slug(title: str) -> str:
+    """从标题生成短 slug。"""
+    import re
+    # 去掉特殊字符，保留中文/英文/数字
+    cleaned = re.sub(r'[^\w\u4e00-\u9fff]', '-', title)
+    cleaned = re.sub(r'-+', '-', cleaned).strip('-')
+    return cleaned[:30] if cleaned else "untitled"
+
+
+# ═══════════════════════════════════════════════════════════════
+# Mode: from-plan
+# ═══════════════════════════════════════════════════════════════
+
+def load_topic(topic_id: str) -> dict | None:
+    """加载 topic.json。"""
+    path = DRAFTS_DIR / topic_id / "topic.json"
+    if not path.exists():
+        print(f"❌ topic.json 不存在: {path}", file=sys.stderr)
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def get_planned_posts(topic: dict, post_ids: list[str] | None = None, count: int | None = None) -> list[dict]:
+    """获取待生成的帖子规划。"""
+    posts = topic.get("posts", [])
+
+    if post_ids:
+        return [p for p in posts if p["id"] in post_ids]
+
+    # 过滤已经有content.json的（status != planned）
+    planned = []
+    for p in posts:
+        post_id = p["id"]
+        # 检查是否已有内容
+        topic_dir = DRAFTS_DIR / topic["topic_id"]
+        found = False
+        if topic_dir.exists():
+            for sub in topic_dir.iterdir():
+                if sub.is_dir() and sub.name.startswith(f"{post_id}_"):
+                    cj = sub / "content.json"
+                    if cj.exists():
+                        existing = json.loads(cj.read_text(encoding="utf-8"))
+                        if existing.get("status") not in ("planned", None):
+                            found = True
+                            break
+        if not found:
+            planned.append(p)
+
+    # 按 priority 排序
+    priority_order = {"high": 0, "medium": 1, "low": 2}
+    planned.sort(key=lambda p: priority_order.get(p.get("priority", "low"), 3))
+
+    if count:
+        planned = planned[:count]
+
+    return planned
+
+
+def build_plan_prompt(topic: dict, posts: list[dict], sense_context: str = "") -> str:
+    """为 from-plan 模式构建 prompt。"""
+    lines = []
+    lines.append(f"## 任务")
+    lines.append(f"请为以下选题规划生成完整的小红书帖子内容。")
+    lines.append(f"每篇都要严格按照系统提示的JSON格式输出。")
+    lines.append(f"共 {len(posts)} 篇，请输出 JSON array。")
+    lines.append(f"")
+    lines.append(f"## Topic 信息")
+    lines.append(f"- topic_id: {topic['topic_id']}")
+    lines.append(f"- topic_name: {topic['topic_name']}")
+    lines.append(f"- angle: {topic.get('topic_angle', '')}")
+    lines.append(f"")
+
+    if sense_context:
+        lines.append(f"## 最新趋势信号（写作时可参考）")
+        lines.append(sense_context)
+        lines.append(f"")
+
+    lines.append(f"## 待生成的帖子")
+    for p in posts:
+        lines.append(f"")
+        lines.append(f"### post_id: {p['id']}")
+        lines.append(f"- 标题方向: {p['title']}")
+        lines.append(f"- 角度: {p.get('angle', '')}")
+        lines.append(f"- 内容类型: {p.get('content_type', '')}")
+        kps = p.get("key_points", [])
+        if kps:
+            lines.append(f"- 要点: {'; '.join(kps)}")
+        ref = p.get("source_ref", "")
+        if ref:
+            lines.append(f"- 素材参考: {ref}")
+
+    lines.append(f"")
+    lines.append(f"## 重要提醒")
+    lines.append(f"- 每篇 post_body 必须 600-950 字，不能超 950")
+    lines.append(f"- post_title ≤ 20 字")
+    lines.append(f"- 外国人名不要出现在正文里，只展示观点/数据/方法")
+    lines.append(f"- 每篇末尾都要有钩子引导（评论区扣【关键词】）")
+    lines.append(f"- 输出完整 JSON array，确保可解析")
+
+    return "\n".join(lines)
+
+
+def cmd_from_plan(args):
+    """从 topic.json 规划生成内容。"""
+    content_mode = getattr(args, "mode", "practical") or "practical"
+
+    # 加载 sense 上下文
+    sense_ctx = ""
+    if SENSE_LATEST.exists():
+        try:
+            sense = json.loads(SENSE_LATEST.read_text(encoding="utf-8"))
+            trends = sense.get("trends", [])[:5]
+            if trends:
+                sense_ctx = "\n".join(
+                    f"- [{t.get('strength','')}] {t.get('signal','')} (来源: {', '.join(t.get('sources',[]))})"
+                    for t in trends
+                )
+        except Exception:
+            pass
+
+    if args.all:
+        # 跨所有 topic 选
+        all_planned = []
+        for topic_dir in sorted(DRAFTS_DIR.iterdir()):
+            tj = topic_dir / "topic.json"
+            if not tj.exists():
+                continue
+            topic = json.loads(tj.read_text(encoding="utf-8"))
+            planned = get_planned_posts(topic, count=None)
+            for p in planned:
+                p["_topic"] = topic
+            all_planned.extend(planned)
+
+        # 按 priority 排序，取 count
+        priority_order = {"high": 0, "medium": 1, "low": 2}
+        all_planned.sort(key=lambda p: priority_order.get(p.get("priority", "low"), 3))
+        all_planned = all_planned[:args.count or 5]
+
+        if not all_planned:
+            print("❌ 没有待生成的帖子", file=sys.stderr)
+            return
+
+        # 按 topic 分组，逐组生成
+        from collections import defaultdict
+        by_topic = defaultdict(list)
+        for p in all_planned:
+            by_topic[p["_topic"]["topic_id"]].append(p)
+
+        total_ok = 0
+        total_fail = 0
+        for tid, posts in by_topic.items():
+            topic = posts[0]["_topic"]
+            ok, fail = _generate_batch(topic, posts, sense_ctx, content_mode)
+            total_ok += ok
+            total_fail += fail
+
+        print(f"\n═══ 总计: ✅ {total_ok} 篇成功, ❌ {total_fail} 篇失败 ═══", file=sys.stderr)
+
+    else:
+        # 单 topic 模式
+        topic = load_topic(args.topic)
+        if not topic:
+            return
+
+        post_ids = [p.strip() for p in args.posts.split(",")] if args.posts else None
+        planned = get_planned_posts(topic, post_ids=post_ids, count=args.count)
+
+        if not planned:
+            print(f"❌ 没有待生成的帖子 (topic={args.topic})", file=sys.stderr)
+            return
+
+        _generate_batch(topic, planned, sense_ctx, content_mode)
+
+
+def _generate_batch(topic: dict, posts: list[dict], sense_ctx: str, content_mode: str = "practical") -> tuple[int, int]:
+    """为一组帖子生成内容。返回 (成功数, 失败数)。"""
+    # 每次最多3篇一起生成（控制质量和输出长度）
+    BATCH_SIZE = 3
+    ok_count = 0
+    fail_count = 0
+
+    for i in range(0, len(posts), BATCH_SIZE):
+        chunk = posts[i:i + BATCH_SIZE]
+        ids = [p["id"] for p in chunk]
+        print(f"\n📝 生成 {topic['topic_id']} / {','.join(ids)} ({len(chunk)}篇) [mode={content_mode}]", file=sys.stderr)
+
+        prompt = build_plan_prompt(topic, chunk, sense_ctx)
+        raw = call_gemini(prompt, batch_size=len(chunk), content_mode=content_mode)
+
+        if not raw:
+            fail_count += len(chunk)
+            continue
+
+        results = parse_json_response(raw)
+        if not results:
+            fail_count += len(chunk)
+            continue
+
+        for post_data in results:
+            # 确保 topic_id 正确
+            post_data["topic_id"] = topic["topic_id"]
+
+            # 质检
+            errors = validate_post(post_data)
+            pid = post_data.get("post_id", "??")
+            title = post_data.get("post_title", "??")
+
+            if errors:
+                print(f"  ⚠️ [{pid}] {title} — 质检问题: {'; '.join(errors)}", file=sys.stderr)
+                # 尝试修复常见问题
+                post_data = _auto_fix(post_data, errors)
+                re_errors = validate_post(post_data)
+                if re_errors:
+                    print(f"  ❌ [{pid}] 修复失败: {'; '.join(re_errors)}", file=sys.stderr)
+                    fail_count += 1
+                    continue
+
+            # 保存
+            path = save_draft(post_data)
+            if path:
+                body_len = len(post_data.get("post_body", ""))
+                print(f"  ✅ [{pid}] {title} ({body_len}字) → {path.parent.name}/", file=sys.stderr)
+                ok_count += 1
+            else:
+                fail_count += 1
+
+        # 批次间等待，避免 rate limit
+        if i + BATCH_SIZE < len(posts):
+            time.sleep(2)
+
+    return ok_count, fail_count
+
+
+def _auto_fix(post: dict, errors: list[str]) -> dict:
+    """自动修复常见质检问题。"""
+    # 标题过长 → 截断
+    title = post.get("post_title", "")
+    if len(title) > 20:
+        # 尝试在合适位置截断
+        for sep in ["，", "：", "！", "？", "｜", " "]:
+            idx = title[:20].rfind(sep)
+            if 8 <= idx <= 19:
+                post["post_title"] = title[:idx]
+                break
+        else:
+            post["post_title"] = title[:20]
+
+    # 正文过长 → 截断到最后一个完整段落
+    body = post.get("post_body", "")
+    if len(body) > 950:
+        # 找最后一个段落边界
+        cut = body[:950]
+        last_newline = cut.rfind("\n")
+        if last_newline > 600:
+            post["post_body"] = cut[:last_newline].rstrip()
+        else:
+            post["post_body"] = cut.rstrip()
+
+    return post
+
+
+# ═══════════════════════════════════════════════════════════════
+# Mode: from-sense
+# ═══════════════════════════════════════════════════════════════
+
+def cmd_from_sense(args):
+    """从 Sense 选题建议直接生成内容。"""
+    content_mode = getattr(args, "mode", "practical") or "practical"
+
+    sense_path = Path(args.input) if args.input else SENSE_LATEST
+    if not sense_path.exists():
+        print(f"❌ Sense latest 不存在: {sense_path}", file=sys.stderr)
+        print(f"   请先运行 sense_scan.py", file=sys.stderr)
+        return
+
+    sense = json.loads(sense_path.read_text(encoding="utf-8"))
+    suggestions = sense.get("topic_suggestions", [])
+
+    if not suggestions:
+        print("❌ 没有选题建议", file=sys.stderr)
+        return
+
+    count = args.count or len(suggestions)
+    suggestions = suggestions[:count]
+
+    # 构建趋势上下文
+    trends = sense.get("trends", [])[:5]
+    sense_ctx = "\n".join(
+        f"- [{t.get('strength','')}] {t.get('signal','')} (来源: {', '.join(t.get('sources',[]))})"
+        for t in trends
+    ) if trends else ""
+
+    # 构建高赞帖参考
+    top_posts = sense.get("top_posts", [])[:5]
+    top_ctx = "\n".join(
+        f"- 「{p.get('title','')}」 {p.get('likes',0)}赞/{p.get('collects',0)}藏 — 钩子: {p.get('hook_analysis','')}"
+        for p in top_posts
+    ) if top_posts else ""
+
+    mode_label = "实操干货" if content_mode == "practical" else "资讯解读"
+    print(f"═══ 从 Sense 选题生成 ({len(suggestions)} 篇) [mode={content_mode} {mode_label}] ═══", file=sys.stderr)
+
+    # 构建 prompt
+    lines = []
+    lines.append("## 任务")
+    lines.append(f"请根据以下 {len(suggestions)} 个选题建议，分别生成完整的小红书帖子内容。")
+    lines.append(f"内容模式：**{mode_label}**（{content_mode}），请严格按照系统提示中该模式的要求输出。")
+    lines.append(f"输出 JSON array，每篇一个元素。")
+    lines.append("")
+
+    if sense_ctx:
+        lines.append("## 最新趋势信号")
+        lines.append(sense_ctx)
+        lines.append("")
+
+    if top_ctx:
+        lines.append("## 当前小红书高赞帖参考（学习它们的标题和钩子）")
+        lines.append(top_ctx)
+        lines.append("")
+
+    lines.append("## 选题列表")
+    for i, s in enumerate(suggestions, 1):
+        lines.append(f"")
+        lines.append(f"### 选题 {i}")
+        lines.append(f"- 标题方向: {s.get('title', '')}")
+        lines.append(f"- topic_id: {s.get('topic_id', 'new')}")
+        lines.append(f"- 内容类型: {s.get('content_type', '')}")
+        lines.append(f"- 为什么写: {s.get('reasoning', '')}")
+        ref = s.get("reference_material", "")
+        if ref:
+            lines.append(f"- 素材参考: {ref}")
+        lines.append(f"- post_id: 请用 n{i:02d} (news编号)" if content_mode == "news" else f"- post_id: 请用 s{i:02d} (sense生成的编号)")
+
+    lines.append("")
+    lines.append("## 重要提醒")
+    lines.append("- 每篇 post_body 必须 600-950 字")
+    lines.append("- post_title ≤ 20 字")
+    lines.append("- 外国人名不要出现在正文里")
+    if content_mode == "practical":
+        lines.append("- 每篇末尾都要有钩子引导（评论区扣【关键词】）")
+    else:
+        lines.append("- 每篇末尾用开放问题/关注引导/互动引导收尾（不用PDF钩子）")
+    lines.append("- 参考高赞帖的标题风格")
+    lines.append("- 输出完整 JSON array")
+
+    prompt = "\n".join(lines)
+
+    raw = call_gemini(prompt, batch_size=len(suggestions), content_mode=content_mode)
+    if not raw:
+        return
+
+    results = parse_json_response(raw)
+    if not results:
+        return
+
+    ok = 0
+    fail = 0
+    for post_data in results:
+        # 确保 content_mode 字段存在
+        post_data.setdefault("content_mode", content_mode)
+
+        errors = validate_post(post_data)
+        pid = post_data.get("post_id", "??")
+        title = post_data.get("post_title", "??")
+
+        if errors:
+            print(f"  ⚠️ [{pid}] {title} — {'; '.join(errors)}", file=sys.stderr)
+            post_data = _auto_fix(post_data, errors)
+            if validate_post(post_data):
+                print(f"  ❌ [{pid}] 修复失败", file=sys.stderr)
+                fail += 1
+                continue
+
+        path = save_draft(post_data)
+        if path:
+            body_len = len(post_data.get("post_body", ""))
+            print(f"  ✅ [{pid}] {title} ({body_len}字) → {path.parent.name}/", file=sys.stderr)
+            ok += 1
+        else:
+            fail += 1
+
+    print(f"\n═══ 完成: ✅ {ok} 篇, ❌ {fail} 篇 ═══", file=sys.stderr)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="探子批量内容生成器 — Gemini驱动，零Opus token",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="subcommand")
+
+    # from-plan
+    p_plan = sub.add_parser("from-plan", help="从 topic.json 帖子规划生成")
+    p_plan.add_argument("--topic", "-t", help="topic_id (如 claude-monetization)")
+    p_plan.add_argument("--posts", "-p", help="指定 post_id（逗号分隔，如 01,02,03）")
+    p_plan.add_argument("--count", "-n", type=int, help="自动选前N个planned帖子")
+    p_plan.add_argument("--all", action="store_true", help="跨所有topic自动选")
+    p_plan.add_argument("--mode", "-m", choices=["practical", "news"], default="practical",
+                        help="内容模式: practical(实操干货) | news(资讯解读)")
+
+    # from-sense
+    p_sense = sub.add_parser("from-sense", help="从 Sense 选题建议生成")
+    p_sense.add_argument("--input", "-i", help="Sense latest.json 路径")
+    p_sense.add_argument("--count", "-n", type=int, help="只生成前N个建议")
+    p_sense.add_argument("--mode", "-m", choices=["practical", "news"], default="practical",
+                        help="内容模式: practical(实操干货) | news(资讯解读)")
+
+    args = parser.parse_args()
+    if not args.subcommand:
+        parser.print_help()
+        sys.exit(1)
+
+    if args.subcommand == "from-plan":
+        if not args.all and not args.topic:
+            print("❌ 需要 --topic 或 --all", file=sys.stderr)
+            sys.exit(1)
+        cmd_from_plan(args)
+    elif args.subcommand == "from-sense":
+        cmd_from_sense(args)
+
+
+if __name__ == "__main__":
+    main()

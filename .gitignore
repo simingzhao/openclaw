@@ -120,3 +120,8 @@ dist/protocol.schema.json
 
 # Synthing
 **/.stfolder/
+
+# Python venvs in skills
+.venv/
+venv/
+__pycache__/
