@@ -17,14 +17,15 @@ metadata:
 
 **核心理念**：质量是生命线。不是"用AI写文章"，是"用AI辅助写出好文章"。
 
-## 6阶段Pipeline
+## 7阶段Pipeline
 
 ```
-TOPICS → PLAN → RESEARCH → WRITE → REVIEW → DE-AI
-  ↓        ↓        ↓         ↓        ↓        ↓
-选题建议   框架    补充调研   初稿    质检    去AI化
-(需approve)                                   ↓
-                                           final.md
+TOPICS → PLAN → RESEARCH → WRITE → REVIEW → DE-AI → COVER
+  ↓        ↓        ↓         ↓        ↓        ↓       ↓
+选题建议   框架    补充调研   初稿    质检    去AI化   封面图
+(需approve)                                   ↓       ↓
+                                           final.md  cover.png
+                                                     cover_prompt.txt
 ```
 
 ## Setup
@@ -65,7 +66,7 @@ python3 "$WRITER" run \
   --topic "Kimi Claw发布分析"
 ```
 
-自动执行：PLAN → RESEARCH → WRITE → REVIEW → DE-AI
+自动执行：PLAN → RESEARCH → WRITE → REVIEW → DE-AI → COVER
 
 输出：
 
@@ -74,6 +75,9 @@ python3 "$WRITER" run \
 - `draft.md` — 初稿
 - `review.json` — 质检结果
 - `final.md` — 定稿（去AI化后）
+- `cover_prompt.txt` — 封面图 prompt（优化过的 Nano Banana Pro prompt）
+- `cover_data.json` — 封面图创意数据
+- `cover.png` — 封面图（900×383px，自动裁剪）
 
 ### 3. 同步到iCloud Obsidian
 
@@ -92,6 +96,7 @@ python3 "$WRITER" research --workdir ./article/
 python3 "$WRITER" write --workdir ./article/
 python3 "$WRITER" review --workdir ./article/
 python3 "$WRITER" deai --workdir ./article/
+python3 "$WRITER" cover --workdir ./article/  # 基于 final.md 生成封面图
 ```
 
 ### 语气/风格微调（写完之后调整）
@@ -117,14 +122,17 @@ python3 "$WRITER" tone-adjust \
 
 ## 模型配置
 
-| 阶段     | 模型             | Thinking | Grounding        |
-| -------- | ---------------- | -------- | ---------------- |
-| TOPICS   | gemini-2.5-flash | off      | ❌               |
-| PLAN     | gemini-2.5-pro   | high     | ❌               |
-| RESEARCH | gemini-2.5-flash | off      | ✅ Google Search |
-| WRITE    | gemini-2.5-flash | off      | ✅ Google Search |
-| REVIEW   | gemini-2.5-pro   | high     | ❌               |
-| DE-AI    | gemini-2.5-pro   | high     | ❌               |
+| 阶段     | 模型                             | Thinking | Grounding        |
+| -------- | -------------------------------- | -------- | ---------------- |
+| TOPICS   | gemini-3-flash                   | off      | ❌               |
+| PLAN     | gemini-3-flash                   | off      | ❌               |
+| RESEARCH | gemini-3-flash                   | off      | ✅ Google Search |
+| WRITE    | gemini-3-flash                   | off      | ❌               |
+| REVIEW   | gemini-3-flash                   | off      | ❌               |
+| DE-AI    | gemini-3-flash                   | off      | ❌               |
+| COVER    | gemini-3-flash → nano-banana-pro | off      | ❌               |
+
+COVER 阶段分两步：先用 Gemini 生成优化的封面 prompt，再用 Nano Banana Pro 生成图片（fallback: gemini-3-pro-image → gemini-2.5-flash-image）。
 
 ## Persona配置
 
@@ -156,7 +164,8 @@ skills/wechat-writer/
 │       ├── research.md       # 调研prompt
 │       ├── write.md          # 写作prompt
 │       ├── review.md         # 审核prompt
-│       └── deai.md           # 去AI化prompt
+│       ├── deai.md           # 去AI化prompt
+│       └── cover.md          # 封面图prompt生成
 ├── personas/
 │   └── default.yaml          # 公众号人设
 └── examples/

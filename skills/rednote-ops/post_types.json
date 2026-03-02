@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "types": {
+    "tutorial": {
+      "name": "实操教程",
+      "body_length": [700, 950],
+      "cover_styles": ["hook-cover", "typography-card"],
+      "image_strategy": "single_cover",
+      "prompt_mode": "practical",
+      "de_ai_styles": ["老司机带路", "技术翻译官"]
+    },
+    "case": {
+      "name": "案例拆解",
+      "body_length": [600, 900],
+      "cover_styles": ["hook-cover", "typography-card"],
+      "image_strategy": "single_cover",
+      "prompt_mode": "practical",
+      "de_ai_styles": ["搞钱日记", "老司机带路"]
+    },
+    "news": {
+      "name": "资讯解读",
+      "body_length": [500, 800],
+      "cover_styles": ["hook-cover", "typography-card"],
+      "image_strategy": "single_or_multi_text",
+      "prompt_mode": "news",
+      "de_ai_styles": ["毒舌测评", "技术翻译官"]
+    },
+    "story": {
+      "name": "故事叙事",
+      "body_length": [200, 400],
+      "cover_styles": ["ai-illustration"],
+      "image_strategy": "multi_narrative",
+      "prompt_mode": "story",
+      "de_ai_styles": ["闺蜜唠嗑", "搞钱日记"]
+    },
+    "longread": {
+      "name": "长文笔记",
+      "body_length": [800, 1200],
+      "cover_styles": ["typography-card"],
+      "image_strategy": "multi_text_slides",
+      "prompt_mode": "practical",
+      "de_ai_styles": ["老司机带路", "技术翻译官"]
+    }
+  }
+}

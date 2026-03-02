@@ -49,15 +49,6 @@ WORKSPACE = Path(os.environ.get(
 
 DRAFTS_DIR = WORKSPACE / "content" / "drafts"
 SENSE_LATEST = WORKSPACE / "sense" / "latest.json"
-POST_TYPES_PATH = Path(__file__).resolve().parent.parent / "post_types.json"
-
-POST_TYPE_CHOICES = ["tutorial", "case", "news", "story", "longread"]
-MODE_DEFAULT_BODY_LENGTH = {
-    "practical": (600, 950),  # 保持向后兼容
-    "news": (600, 950),       # 保持向后兼容
-    "story": (200, 400),
-    "longread": (800, 1200),
-}
 
 OBSIDIAN_VAULT = Path(os.path.expanduser(
     "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/OpenClaw_Vault"
@@ -237,94 +228,13 @@ PROMPT_NEWS = _BASE_IDENTITY + """
 2. **探子怎么看**（2-3段，给出独立判断，敢说"这个被高估了"或"这才是真正的拐点"）
 3. **跟你有什么关系**（1-2段，落到普通人/创作者/超级个体的实际影响+行动建议）"""
 
-PROMPT_STORY = _BASE_IDENTITY + """
-## 模式：故事叙事（story）
-
-### 内容标准
-- 正文很短（200-400字），是图片的补充说明
-- 主要叙事靠图片承载
-- 每张图对应一个场景/步骤/转折
-
-### 输出字段
-{
-  "topic_id": "xxx",
-  "post_id": "xx",
-  "content_mode": "story",
-  "post_title": "≤20字",
-  "post_body": "200-400字补充文字",
-  "slides": [
-    {"page": 1, "text": "这张图上的文字", "scene_desc": "场景描述，用于AI生图"},
-    {"page": 2, "text": "...", "scene_desc": "..."}
-  ],
-  "tags": [...],
-  "status": "draft"
-}
-"""
-
-PROMPT_LONGREAD = _BASE_IDENTITY + """
-## 模式：长文笔记（longread）
-
-### 内容标准
-✅ 必须有：
-- 完整、可执行的深度内容（800-1200字）
-- 有清晰结构，适合拆成多页图文
-- 每页有明确标题和重点信息
-
-### 输出字段
-```json
-{
-  "topic_id": "xxx",
-  "post_id": "xx",
-  "content_mode": "longread",
-  "style_id": "typography-card",
-  "cover_title": "封面标题\\n可分3行",
-  "cover_subtitle": "",
-  "post_title": "帖子标题（≤20字）",
-  "post_body": "完整正文（800-1200字）",
-  "slides": [
-    {"page": 1, "title": "页标题", "points": ["要点1", "要点2"]},
-    {"page": 2, "title": "页标题", "points": ["要点1", "要点2"]}
-  ],
-  "tags": ["AI", "标签2", "标签3", "标签4", "标签5"],
-  "cta_type": "discuss|follow|vote",
-  "cta_question": "结尾引导问题",
-  "status": "draft",
-  "created_at": "YYYY-MM-DD"
-}
-```
-""" + _COVER_RULES
-
-PROMPT_VARIANTS = _BASE_IDENTITY + """
-## 模式：轻量选题方案
-
-为每个选题生成 {n} 个不同角度的方案。不需要写完整正文，只需要：
-1. 标题（≤20字）
-2. 封面文案（3行，每行≤12字）
-3. 200字内容摘要
-4. 切入角度说明（1句话）
-
-输出JSON数组，每个元素：
-{
-  "variant_id": 1,
-  "post_title": "...",
-  "cover_title": "...",
-  "summary": "200字摘要",
-  "angle": "切入角度说明"
-}
-"""
-
 # prompt 选择器
 SYSTEM_PROMPTS = {
     "practical": PROMPT_PRACTICAL,
     "news": PROMPT_NEWS,
-    "story": PROMPT_STORY,
-    "longread": PROMPT_LONGREAD,
-    "variants": PROMPT_VARIANTS,
 }
 
-def get_system_prompt(mode: str, variant_count: int = 1) -> str:
-    if mode == "variants":
-        return PROMPT_VARIANTS.replace("{n}", str(max(1, variant_count)))
+def get_system_prompt(mode: str) -> str:
     return SYSTEM_PROMPTS.get(mode, PROMPT_PRACTICAL)
 
 
@@ -332,24 +242,14 @@ def get_system_prompt(mode: str, variant_count: int = 1) -> str:
 # Gemini 调用
 # ═══════════════════════════════════════════════════════════════
 
-def call_gemini(
-    user_prompt: str,
-    batch_size: int = 1,
-    content_mode: str = "practical",
-    variant_count: int = 1,
-) -> str | None:
+def call_gemini(user_prompt: str, batch_size: int = 1, content_mode: str = "practical") -> str | None:
     """调用 Gemini 生成内容，返回原始文本。"""
     client = genai.Client()
-    system_prompt = get_system_prompt(content_mode, variant_count=variant_count)
+    system_prompt = get_system_prompt(content_mode)
 
     # 按篇数动态调整 max_output_tokens
     # 单篇中文约 1000 字 ≈ ~2000 tokens，加上JSON结构开销给 5000
-    if content_mode == "variants":
-        # variants模式：Gemini中文token效率低，每个variant需要~2500 tokens
-        tokens_per_post = 2500 * max(variant_count, 3)
-    else:
-        # Gemini中文token效率低，950字正文+JSON结构需要~8000 tokens
-        tokens_per_post = 8192
+    tokens_per_post = 5000
     max_tokens = min(tokens_per_post * max(batch_size, 1), 65536)
 
     for model in [MODEL_PRIMARY, MODEL_FALLBACK]:
@@ -441,148 +341,11 @@ def parse_json_response(text: str) -> list[dict]:
         return []
 
 
-def load_post_types_config() -> dict | None:
-    """加载 post_types.json（skill目录下）。"""
-    if not POST_TYPES_PATH.exists():
-        print(f"❌ post_types.json 不存在: {POST_TYPES_PATH}", file=sys.stderr)
-        return None
-    try:
-        data = json.loads(POST_TYPES_PATH.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        print(f"❌ post_types.json 解析失败: {e}", file=sys.stderr)
-        return None
-    if not isinstance(data, dict) or not isinstance(data.get("types"), dict):
-        print(f"❌ post_types.json 结构无效: 缺少 types", file=sys.stderr)
-        return None
-    return data
-
-
-def get_post_type_settings(post_type: str | None) -> dict | None:
-    if not post_type:
-        return None
-    cfg = load_post_types_config()
-    if not cfg:
-        return None
-    item = cfg.get("types", {}).get(post_type)
-    if not isinstance(item, dict):
-        print(f"❌ 未找到 post type: {post_type}", file=sys.stderr)
-        return None
-    return item
-
-
-def _parse_body_length(raw: object, default_value: tuple[int, int]) -> tuple[int, int]:
-    if isinstance(raw, (list, tuple)) and len(raw) == 2:
-        try:
-            low = int(raw[0])
-            high = int(raw[1])
-            if low > 0 and high >= low:
-                return (low, high)
-        except Exception:
-            pass
-    return default_value
-
-
-def body_length_for_mode(content_mode: str) -> tuple[int, int]:
-    return MODE_DEFAULT_BODY_LENGTH.get(content_mode, MODE_DEFAULT_BODY_LENGTH["practical"])
-
-
-def resolve_generation_profile(args) -> dict | None:
-    """统一解析 mode/type/字数范围/样式配置。"""
-    requested_type = getattr(args, "type", None)
-    requested_mode = getattr(args, "mode", "practical") or "practical"
-
-    profile = {
-        "post_type": None,
-        "post_type_name": "",
-        "content_mode": requested_mode,
-        "body_length": body_length_for_mode(requested_mode),
-        "style_id": "hook-cover",
-    }
-
-    if not requested_type:
-        return profile
-
-    post_type_cfg = get_post_type_settings(requested_type)
-    if not post_type_cfg:
-        return None
-
-    cover_styles = post_type_cfg.get("cover_styles") or []
-    profile.update(
-        {
-            "post_type": requested_type,
-            "post_type_name": str(post_type_cfg.get("name", "")),
-            "content_mode": str(post_type_cfg.get("prompt_mode", requested_mode)),
-            "body_length": _parse_body_length(
-                post_type_cfg.get("body_length"),
-                body_length_for_mode(str(post_type_cfg.get("prompt_mode", requested_mode))),
-            ),
-            "style_id": cover_styles[0] if cover_styles else "hook-cover",
-        }
-    )
-    return profile
-
-
-def parse_variant_items(results: list[dict], variant_count: int) -> list[dict]:
-    """解析并标准化轻量 variants 输出。"""
-    if not results:
-        return []
-
-    candidates: list[dict] = []
-    if len(results) == 1 and isinstance(results[0], dict) and isinstance(results[0].get("variants"), list):
-        items = results[0].get("variants") or []
-    else:
-        items = results
-
-    for idx, item in enumerate(items, 1):
-        if not isinstance(item, dict):
-            continue
-        angle = item.get("angle", "")
-        if not angle:
-            angle = item.get("suggested_angle", "")
-        try:
-            variant_id = int(item.get("variant_id", idx) or idx)
-        except Exception:
-            variant_id = idx
-        candidates.append(
-            {
-                "variant_id": variant_id,
-                "post_title": str(item.get("post_title", "")).strip(),
-                "cover_title": str(item.get("cover_title", "")).strip(),
-                "summary": str(item.get("summary", "")).strip(),
-                "angle": str(angle).strip(),
-            }
-        )
-
-    cleaned = [v for v in candidates if v.get("post_title") and v.get("cover_title")]
-    cleaned = cleaned[: max(1, variant_count)]
-
-    # 变体ID重排，避免模型输出重复/错号
-    for idx, item in enumerate(cleaned, 1):
-        item["variant_id"] = idx
-
-    # 标题长度校验：超20字的打warning（不截断，留给用户/expand阶段处理）
-    for item in cleaned:
-        title = item.get("post_title", "")
-        if len(title) > 20:
-            print(f"  ⚠️ variant {item['variant_id']} 标题过长: {len(title)}字 > 20字: {title}", file=sys.stderr)
-
-    return cleaned
-
-
-def pick_variant(variants: list[dict], variant_id: int) -> dict | None:
-    for item in variants:
-        if int(item.get("variant_id", -1)) == variant_id:
-            return item
-    if 1 <= variant_id <= len(variants):
-        return variants[variant_id - 1]
-    return None
-
-
 # ═══════════════════════════════════════════════════════════════
 # 质检
 # ═══════════════════════════════════════════════════════════════
 
-def validate_post(post: dict, body_length: tuple[int, int] | None = None) -> list[str]:
+def validate_post(post: dict) -> list[str]:
     """校验单篇帖子，返回错误列表（空=通过）。"""
     errors = []
     title = post.get("post_title", "")
@@ -590,7 +353,6 @@ def validate_post(post: dict, body_length: tuple[int, int] | None = None) -> lis
     cover = post.get("cover_title", "")
     tags = post.get("tags", [])
     mode = post.get("content_mode", "practical")
-    min_body, max_body = body_length or body_length_for_mode(mode)
 
     if not title:
         errors.append("缺少 post_title")
@@ -599,19 +361,19 @@ def validate_post(post: dict, body_length: tuple[int, int] | None = None) -> lis
 
     if not body:
         errors.append("缺少 post_body")
-    elif len(body) < min_body:
-        errors.append(f"post_body 过短: {len(body)}字 (需≥{min_body})")
-    elif len(body) > max_body:
-        errors.append(f"post_body 过长: {len(body)}字 (限{max_body})")
+    elif len(body) < 300:
+        errors.append(f"post_body 过短: {len(body)}字 (需≥300)")
+    elif len(body) > 950:
+        errors.append(f"post_body 过长: {len(body)}字 (限950)")
 
-    if mode != "story" and not cover:
+    if not cover:
         errors.append("缺少 cover_title")
 
-    if mode != "story" and (not tags or len(tags) < 2):
+    if not tags or len(tags) < 2:
         errors.append("tags 太少 (需≥2)")
 
     # 两种模式都建议有 cta
-    if mode in ("practical", "news", "longread") and not post.get("cta_type") and not post.get("cta_question") and not post.get("hook_keyword"):
+    if not post.get("cta_type") and not post.get("cta_question") and not post.get("hook_keyword"):
         errors.append("缺少结尾引导(cta_type/cta_question)")
 
     return errors
@@ -780,15 +542,8 @@ def get_planned_posts(topic: dict, post_ids: list[str] | None = None, count: int
     return planned
 
 
-def build_plan_prompt(
-    topic: dict,
-    posts: list[dict],
-    sense_context: str = "",
-    body_length: tuple[int, int] = (600, 950),
-    post_type: str | None = None,
-) -> str:
+def build_plan_prompt(topic: dict, posts: list[dict], sense_context: str = "") -> str:
     """为 from-plan 模式构建 prompt。"""
-    min_body, max_body = body_length
     lines = []
     lines.append(f"## 任务")
     lines.append(f"请为以下选题规划生成完整的小红书帖子内容。")
@@ -799,8 +554,6 @@ def build_plan_prompt(
     lines.append(f"- topic_id: {topic['topic_id']}")
     lines.append(f"- topic_name: {topic['topic_name']}")
     lines.append(f"- angle: {topic.get('topic_angle', '')}")
-    if post_type:
-        lines.append(f"- post_type: {post_type}")
     lines.append(f"")
 
     if sense_context:
@@ -824,7 +577,7 @@ def build_plan_prompt(
 
     lines.append(f"")
     lines.append(f"## 重要提醒")
-    lines.append(f"- 每篇 post_body 必须 {min_body}-{max_body} 字")
+    lines.append(f"- 每篇 post_body 必须 600-950 字，不能超 950")
     lines.append(f"- post_title ≤ 20 字")
     lines.append(f"- 外国人名不要出现在正文里，只展示观点/数据/方法")
     lines.append(f"- 每篇末尾用讨论引导/关注引导收尾（不搞扣关键词私信）")
@@ -833,141 +586,9 @@ def build_plan_prompt(
     return "\n".join(lines)
 
 
-def build_plan_variants_prompt(
-    topic: dict,
-    post: dict,
-    sense_context: str,
-    variant_count: int,
-    body_length: tuple[int, int],
-    content_mode: str,
-    post_type: str | None,
-) -> str:
-    min_body, max_body = body_length
-    lines = []
-    lines.append("## 任务")
-    lines.append(f"请围绕下面这个选题，生成 {variant_count} 个轻量方案（只出标题/封面/摘要/角度）。")
-    lines.append("输出 JSON array。")
-    lines.append("")
-    lines.append("## Topic 信息")
-    lines.append(f"- topic_id: {topic.get('topic_id', '')}")
-    lines.append(f"- topic_name: {topic.get('topic_name', '')}")
-    if post_type:
-        lines.append(f"- post_type: {post_type}")
-    lines.append(f"- content_mode: {content_mode}")
-    lines.append(f"- 正文目标字数（后续扩写）: {min_body}-{max_body}")
-    lines.append("")
-    if sense_context:
-        lines.append("## 最新趋势信号")
-        lines.append(sense_context)
-        lines.append("")
-    lines.append("## 当前选题")
-    lines.append(f"- post_id: {post.get('id', 'xx')}")
-    lines.append(f"- 标题方向: {post.get('title', '')}")
-    lines.append(f"- 角度: {post.get('angle', '')}")
-    lines.append(f"- 内容类型: {post.get('content_type', '')}")
-    kps = post.get("key_points", [])
-    if kps:
-        lines.append(f"- 要点: {'; '.join(kps)}")
-    ref = post.get("source_ref", "")
-    if ref:
-        lines.append(f"- 素材参考: {ref}")
-    lines.append("")
-    lines.append("## 重要提醒")
-    lines.append("- 只输出 JSON array，不要任何解释")
-    lines.append("- 每个方案都要明显不同，避免同义改写")
-    lines.append("- 封面文案用 \\n 分3行")
-    lines.append("- summary 写成约200字，后续可直接扩写成正文")
-    return "\n".join(lines)
-
-
-def build_sense_variants_prompt(
-    suggestion: dict,
-    sense_context: str,
-    top_context: str,
-    variant_count: int,
-    body_length: tuple[int, int],
-    content_mode: str,
-    post_type: str | None,
-) -> str:
-    min_body, max_body = body_length
-    lines = []
-    lines.append("## 任务")
-    lines.append(f"请基于这个 Sense 选题，生成 {variant_count} 个轻量方案（标题+封面+摘要+角度）。")
-    lines.append("输出 JSON array。")
-    lines.append("")
-    lines.append("## 选题信息")
-    lines.append(f"- topic_id: {suggestion.get('topic_id', 'new')}")
-    lines.append(f"- 标题方向: {suggestion.get('title', '')}")
-    lines.append(f"- 内容类型: {suggestion.get('content_type', '')}")
-    lines.append(f"- 为什么写: {suggestion.get('reasoning', '')}")
-    if post_type:
-        lines.append(f"- post_type: {post_type}")
-    lines.append(f"- content_mode: {content_mode}")
-    lines.append(f"- 正文目标字数（后续扩写）: {min_body}-{max_body}")
-    ref = suggestion.get("reference_material", "")
-    if ref:
-        lines.append(f"- 素材参考: {ref}")
-    lines.append("")
-    if sense_context:
-        lines.append("## 最新趋势信号")
-        lines.append(sense_context)
-        lines.append("")
-    if top_context:
-        lines.append("## 高赞帖风格参考")
-        lines.append(top_context)
-        lines.append("")
-    lines.append("## 重要提醒")
-    lines.append("- 只输出 JSON array，不要额外文字")
-    lines.append("- 方案之间切入角度必须不同")
-    lines.append("- cover_title 用 \\n 分3行，每行≤12字")
-    return "\n".join(lines)
-
-
-def build_expand_prompt(
-    draft: dict,
-    variant: dict,
-    body_length: tuple[int, int],
-    content_mode: str,
-) -> str:
-    min_body, max_body = body_length
-    lines = []
-    lines.append("## 任务")
-    lines.append("请把以下已选变体扩写成完整帖子，输出单个 JSON object。")
-    lines.append("")
-    lines.append("## 固定字段")
-    lines.append(f"- topic_id: {draft.get('topic_id', 'unknown')}")
-    lines.append(f"- post_id: {draft.get('post_id', 'xx')}")
-    lines.append(f"- content_mode: {content_mode}")
-    lines.append(f"- post_title: {variant.get('post_title', '')}")
-    lines.append(f"- cover_title: {variant.get('cover_title', '')}")
-    lines.append(f"- angle: {variant.get('angle', '')}")
-    summary = variant.get("summary", "")
-    if summary:
-        lines.append(f"- summary: {summary}")
-    lines.append("")
-    lines.append("## 扩写要求")
-    lines.append(f"- post_body 字数: {min_body}-{max_body}")
-    lines.append("- 保持选中变体的标题与封面文案，不要改题")
-    lines.append("- 输出字段要完整，JSON可直接解析")
-    return "\n".join(lines)
-
-
 def cmd_from_plan(args):
     """从 topic.json 规划生成内容。"""
-    profile = resolve_generation_profile(args)
-    if not profile:
-        return
-    content_mode = profile["content_mode"]
-    body_length = profile["body_length"]
-    post_type = profile["post_type"]
-    style_id = profile["style_id"]
-    variant_count = max(1, getattr(args, "variants", 1) or 1)
-
-    if post_type:
-        print(
-            f"═══ 使用 post_type={post_type} mode={content_mode} body={body_length[0]}-{body_length[1]} ═══",
-            file=sys.stderr,
-        )
+    content_mode = getattr(args, "mode", "practical") or "practical"
 
     # 加载 sense 上下文
     sense_ctx = ""
@@ -1015,18 +636,7 @@ def cmd_from_plan(args):
         total_fail = 0
         for tid, posts in by_topic.items():
             topic = posts[0]["_topic"]
-            if variant_count > 1:
-                ok, fail = _generate_plan_variants(topic, posts, sense_ctx, profile, variant_count)
-            else:
-                ok, fail = _generate_batch(
-                    topic,
-                    posts,
-                    sense_ctx,
-                    content_mode=content_mode,
-                    body_length=body_length,
-                    post_type=post_type,
-                    style_id=style_id,
-                )
+            ok, fail = _generate_batch(topic, posts, sense_ctx, content_mode)
             total_ok += ok
             total_fail += fail
 
@@ -1045,100 +655,10 @@ def cmd_from_plan(args):
             print(f"❌ 没有待生成的帖子 (topic={args.topic})", file=sys.stderr)
             return
 
-        if variant_count > 1:
-            _generate_plan_variants(topic, planned, sense_ctx, profile, variant_count)
-        else:
-            _generate_batch(
-                topic,
-                planned,
-                sense_ctx,
-                content_mode=content_mode,
-                body_length=body_length,
-                post_type=post_type,
-                style_id=style_id,
-            )
+        _generate_batch(topic, planned, sense_ctx, content_mode)
 
 
-def _generate_plan_variants(
-    topic: dict,
-    posts: list[dict],
-    sense_ctx: str,
-    profile: dict,
-    variant_count: int,
-) -> tuple[int, int]:
-    ok_count = 0
-    fail_count = 0
-
-    for post in posts:
-        post_id = post.get("id", "xx")
-        print(
-            f"\n🧪 生成轻量方案 {topic.get('topic_id', 'unknown')} / {post_id} ({variant_count} variants)",
-            file=sys.stderr,
-        )
-        prompt = build_plan_variants_prompt(
-            topic=topic,
-            post=post,
-            sense_context=sense_ctx,
-            variant_count=variant_count,
-            body_length=profile["body_length"],
-            content_mode=profile["content_mode"],
-            post_type=profile["post_type"],
-        )
-        raw = call_gemini(
-            prompt,
-            batch_size=1,
-            content_mode="variants",
-            variant_count=variant_count,
-        )
-        if not raw:
-            fail_count += 1
-            continue
-
-        variants = parse_variant_items(parse_json_response(raw), variant_count)
-        if not variants:
-            print(f"  ❌ [{post_id}] 变体解析失败", file=sys.stderr)
-            fail_count += 1
-            continue
-
-        draft = {
-            "topic_id": topic.get("topic_id", "unknown"),
-            "post_id": post_id,
-            "content_mode": profile["content_mode"],
-            "style_id": profile["style_id"],
-            "post_title": variants[0].get("post_title", post.get("title", "untitled")),
-            "cover_title": variants[0].get("cover_title", ""),
-            "post_body": "",
-            "tags": [],
-            "variants": variants,
-            "status": "variant_review",
-            "created_at": TODAY,
-            "published_at": None,
-            "published_id": None,
-        }
-        if profile["post_type"]:
-            draft["post_type"] = profile["post_type"]
-
-        path = save_draft(draft)
-        if path:
-            print(f"  ✅ [{post_id}] 变体已保存 ({len(variants)}个) → {path.parent.name}/", file=sys.stderr)
-            ok_count += 1
-        else:
-            fail_count += 1
-
-        time.sleep(1)
-
-    return ok_count, fail_count
-
-
-def _generate_batch(
-    topic: dict,
-    posts: list[dict],
-    sense_ctx: str,
-    content_mode: str = "practical",
-    body_length: tuple[int, int] = (600, 950),
-    post_type: str | None = None,
-    style_id: str = "hook-cover",
-) -> tuple[int, int]:
+def _generate_batch(topic: dict, posts: list[dict], sense_ctx: str, content_mode: str = "practical") -> tuple[int, int]:
     """为一组帖子生成内容。返回 (成功数, 失败数)。"""
     # 每次最多3篇一起生成（控制质量和输出长度）
     BATCH_SIZE = 3
@@ -1150,13 +670,7 @@ def _generate_batch(
         ids = [p["id"] for p in chunk]
         print(f"\n📝 生成 {topic['topic_id']} / {','.join(ids)} ({len(chunk)}篇) [mode={content_mode}]", file=sys.stderr)
 
-        prompt = build_plan_prompt(
-            topic,
-            chunk,
-            sense_ctx,
-            body_length=body_length,
-            post_type=post_type,
-        )
+        prompt = build_plan_prompt(topic, chunk, sense_ctx)
         raw = call_gemini(prompt, batch_size=len(chunk), content_mode=content_mode)
 
         if not raw:
@@ -1171,21 +685,17 @@ def _generate_batch(
         for post_data in results:
             # 确保 topic_id 正确
             post_data["topic_id"] = topic["topic_id"]
-            post_data.setdefault("content_mode", content_mode)
-            post_data.setdefault("style_id", style_id)
-            if post_type:
-                post_data["post_type"] = post_type
 
             # 质检
-            errors = validate_post(post_data, body_length=body_length)
+            errors = validate_post(post_data)
             pid = post_data.get("post_id", "??")
             title = post_data.get("post_title", "??")
 
             if errors:
                 print(f"  ⚠️ [{pid}] {title} — 质检问题: {'; '.join(errors)}", file=sys.stderr)
                 # 尝试修复常见问题
-                post_data = _auto_fix(post_data, errors, body_length=body_length)
-                re_errors = validate_post(post_data, body_length=body_length)
+                post_data = _auto_fix(post_data, errors)
+                re_errors = validate_post(post_data)
                 if re_errors:
                     print(f"  ❌ [{pid}] 修复失败: {'; '.join(re_errors)}", file=sys.stderr)
                     fail_count += 1
@@ -1207,42 +717,27 @@ def _generate_batch(
     return ok_count, fail_count
 
 
-def _auto_fix(post: dict, errors: list[str], body_length: tuple[int, int] | None = None) -> dict:
+def _auto_fix(post: dict, errors: list[str]) -> dict:
     """自动修复常见质检问题。"""
-    min_body, max_body = body_length or body_length_for_mode(post.get("content_mode", "practical"))
-
-    # 标题过长 → 智能截断（不在英文单词中间断）
+    # 标题过长 → 截断
     title = post.get("post_title", "")
     if len(title) > 20:
-        # 策略：先找中文标点截断点（优先语义完整），再尝试英文单词边界
-        best_cut = None
-        # 1. 中文标点截断（最干净）
-        for sep in ["，", "：", "！", "？", "｜"]:
-            idx = title[:21].rfind(sep)
-            if 10 <= idx <= 20:
-                best_cut = idx  # 截到标点前（不含标点）
+        # 尝试在合适位置截断
+        for sep in ["，", "：", "！", "？", "｜", " "]:
+            idx = title[:20].rfind(sep)
+            if 8 <= idx <= 19:
+                post["post_title"] = title[:idx]
                 break
-            elif 8 <= idx < 10:
-                best_cut = best_cut or idx
-        
-        if best_cut is None:
-            # 2. 从第20字位置往回找，确保不切断英文单词
-            cut_pos = 20
-            # 如果第20字在英文单词中间，往回退到单词开头
-            while cut_pos > 10 and title[cut_pos - 1].isascii() and title[cut_pos - 1] != ' ':
-                cut_pos -= 1
-            # 去掉尾部空格
-            best_cut = cut_pos
-        
-        post["post_title"] = title[:best_cut].rstrip()
+        else:
+            post["post_title"] = title[:20]
 
     # 正文过长 → 截断到最后一个完整段落
     body = post.get("post_body", "")
-    if len(body) > max_body:
+    if len(body) > 950:
         # 找最后一个段落边界
-        cut = body[:max_body]
+        cut = body[:950]
         last_newline = cut.rfind("\n")
-        if last_newline > max(min_body, 300):
+        if last_newline > 600:
             post["post_body"] = cut[:last_newline].rstrip()
         else:
             post["post_body"] = cut.rstrip()
@@ -1256,16 +751,7 @@ def _auto_fix(post: dict, errors: list[str], body_length: tuple[int, int] | None
 
 def cmd_from_sense(args):
     """从 Sense 选题建议直接生成内容。"""
-    profile = resolve_generation_profile(args)
-    if not profile:
-        return
-
-    content_mode = profile["content_mode"]
-    body_length = profile["body_length"]
-    post_type = profile["post_type"]
-    style_id = profile["style_id"]
-    variant_count = max(1, getattr(args, "variants", 1) or 1)
-    min_body, max_body = body_length
+    content_mode = getattr(args, "mode", "practical") or "practical"
 
     sense_path = Path(args.input) if args.input else SENSE_LATEST
     if not sense_path.exists():
@@ -1297,78 +783,7 @@ def cmd_from_sense(args):
         for p in top_posts
     ) if top_posts else ""
 
-    mode_labels = {
-        "practical": "实操干货",
-        "news": "资讯解读",
-        "story": "故事叙事",
-        "longread": "长文笔记",
-    }
-    mode_label = mode_labels.get(content_mode, content_mode)
-
-    if variant_count > 1:
-        print(
-            f"═══ 从 Sense 生成轻量方案 ({len(suggestions)} 篇 × {variant_count} variants) [mode={content_mode}] ═══",
-            file=sys.stderr,
-        )
-        ok = 0
-        fail = 0
-        for i, suggestion in enumerate(suggestions, 1):
-            default_post_id = f"n{i:02d}" if content_mode == "news" else f"s{i:02d}"
-            post_id = suggestion.get("post_id") or default_post_id
-            topic_id = suggestion.get("topic_id", "new")
-            prompt = build_sense_variants_prompt(
-                suggestion=suggestion,
-                sense_context=sense_ctx,
-                top_context=top_ctx,
-                variant_count=variant_count,
-                body_length=body_length,
-                content_mode=content_mode,
-                post_type=post_type,
-            )
-            raw = call_gemini(
-                prompt,
-                batch_size=1,
-                content_mode="variants",
-                variant_count=variant_count,
-            )
-            if not raw:
-                fail += 1
-                continue
-            variants = parse_variant_items(parse_json_response(raw), variant_count)
-            if not variants:
-                print(f"  ❌ [{post_id}] 变体解析失败", file=sys.stderr)
-                fail += 1
-                continue
-
-            draft = {
-                "topic_id": topic_id,
-                "post_id": post_id,
-                "content_mode": content_mode,
-                "style_id": style_id,
-                "post_title": variants[0].get("post_title", suggestion.get("title", "untitled")),
-                "cover_title": variants[0].get("cover_title", ""),
-                "post_body": "",
-                "tags": [],
-                "variants": variants,
-                "status": "variant_review",
-                "created_at": TODAY,
-                "published_at": None,
-                "published_id": None,
-            }
-            if post_type:
-                draft["post_type"] = post_type
-
-            path = save_draft(draft)
-            if path:
-                print(f"  ✅ [{post_id}] 变体已保存 ({len(variants)}个) → {path.parent.name}/", file=sys.stderr)
-                ok += 1
-            else:
-                fail += 1
-            time.sleep(1)
-
-        print(f"\n═══ 完成: ✅ {ok} 篇, ❌ {fail} 篇 ═══", file=sys.stderr)
-        return
-
+    mode_label = "实操干货" if content_mode == "practical" else "资讯解读"
     print(f"═══ 从 Sense 选题生成 ({len(suggestions)} 篇) [mode={content_mode} {mode_label}] ═══", file=sys.stderr)
 
     # 构建 prompt
@@ -1376,8 +791,6 @@ def cmd_from_sense(args):
     lines.append("## 任务")
     lines.append(f"请根据以下 {len(suggestions)} 个选题建议，分别生成完整的小红书帖子内容。")
     lines.append(f"内容模式：**{mode_label}**（{content_mode}），请严格按照系统提示中该模式的要求输出。")
-    if post_type:
-        lines.append(f"指定 post_type：{post_type}")
     lines.append(f"输出 JSON array，每篇一个元素。")
     lines.append("")
 
@@ -1406,7 +819,7 @@ def cmd_from_sense(args):
 
     lines.append("")
     lines.append("## 重要提醒")
-    lines.append(f"- 每篇 post_body 必须 {min_body}-{max_body} 字")
+    lines.append("- 每篇 post_body 必须 600-950 字")
     lines.append("- post_title ≤ 20 字")
     lines.append("- 外国人名不要出现在正文里")
     lines.append("- 每篇末尾用讨论引导/关注引导收尾（不搞扣关键词私信）")
@@ -1428,18 +841,15 @@ def cmd_from_sense(args):
     for post_data in results:
         # 确保 content_mode 字段存在
         post_data.setdefault("content_mode", content_mode)
-        post_data.setdefault("style_id", style_id)
-        if post_type:
-            post_data["post_type"] = post_type
 
-        errors = validate_post(post_data, body_length=body_length)
+        errors = validate_post(post_data)
         pid = post_data.get("post_id", "??")
         title = post_data.get("post_title", "??")
 
         if errors:
             print(f"  ⚠️ [{pid}] {title} — {'; '.join(errors)}", file=sys.stderr)
-            post_data = _auto_fix(post_data, errors, body_length=body_length)
-            if validate_post(post_data, body_length=body_length):
+            post_data = _auto_fix(post_data, errors)
+            if validate_post(post_data):
                 print(f"  ❌ [{pid}] 修复失败", file=sys.stderr)
                 fail += 1
                 continue
@@ -1453,105 +863,6 @@ def cmd_from_sense(args):
             fail += 1
 
     print(f"\n═══ 完成: ✅ {ok} 篇, ❌ {fail} 篇 ═══", file=sys.stderr)
-
-
-# ═══════════════════════════════════════════════════════════════
-# Mode: expand
-# ═══════════════════════════════════════════════════════════════
-
-def cmd_expand(args):
-    """把 variant_review 草稿扩写为完整内容。"""
-    draft_path = Path(args.draft)
-    if not draft_path.exists():
-        print(f"❌ 草稿不存在: {draft_path}", file=sys.stderr)
-        return
-
-    try:
-        draft = json.loads(draft_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"❌ 读取草稿失败: {e}", file=sys.stderr)
-        return
-
-    variants = draft.get("variants") or []
-    if not isinstance(variants, list) or not variants:
-        print("❌ 草稿中没有 variants，可扩写对象为空", file=sys.stderr)
-        return
-
-    selected = pick_variant(variants, args.variant)
-    if not selected:
-        print(f"❌ 未找到 variant={args.variant}", file=sys.stderr)
-        return
-
-    post_type = draft.get("post_type")
-    content_mode = draft.get("content_mode", "practical")
-    if content_mode == "variants":
-        content_mode = "practical"
-    body_length = body_length_for_mode(content_mode)
-    style_id = draft.get("style_id", "hook-cover")
-
-    if post_type:
-        type_cfg = get_post_type_settings(post_type)
-        if not type_cfg:
-            return
-        content_mode = str(type_cfg.get("prompt_mode", content_mode))
-        body_length = _parse_body_length(type_cfg.get("body_length"), body_length_for_mode(content_mode))
-        cover_styles = type_cfg.get("cover_styles") or []
-        if cover_styles and not draft.get("style_id"):
-            style_id = cover_styles[0]
-
-    print(
-        f"═══ 扩写 variant={selected.get('variant_id', args.variant)} mode={content_mode} body={body_length[0]}-{body_length[1]} ═══",
-        file=sys.stderr,
-    )
-
-    prompt = build_expand_prompt(draft, selected, body_length, content_mode)
-    raw = call_gemini(prompt, batch_size=1, content_mode=content_mode)
-    if not raw:
-        return
-
-    results = parse_json_response(raw)
-    if not results:
-        return
-    expanded = results[0]
-    if not isinstance(expanded, dict):
-        print("❌ 扩写结果不是 JSON object", file=sys.stderr)
-        return
-
-    draft["content_mode"] = content_mode
-    draft["style_id"] = style_id
-    if post_type:
-        draft["post_type"] = post_type
-
-    draft["post_title"] = selected.get("post_title") or expanded.get("post_title") or draft.get("post_title", "untitled")
-    draft["cover_title"] = selected.get("cover_title") or expanded.get("cover_title") or draft.get("cover_title", "")
-    draft["post_body"] = expanded.get("post_body", draft.get("post_body", ""))
-    if "cover_subtitle" in expanded:
-        draft["cover_subtitle"] = expanded.get("cover_subtitle", "")
-
-    for key in ["tags", "cta_type", "cta_question", "hook_keyword", "pdf_slug", "pdf_outline", "slides"]:
-        if key in expanded:
-            draft[key] = expanded[key]
-
-    try:
-        draft["selected_variant"] = int(selected.get("variant_id", args.variant))
-    except Exception:
-        draft["selected_variant"] = args.variant
-    draft["selected_angle"] = selected.get("angle", "")
-    draft["status"] = "draft"
-    draft["updated_at"] = TODAY
-
-    errors = validate_post(draft, body_length=body_length)
-    if errors:
-        print(f"  ⚠️ 扩写质检问题: {'; '.join(errors)}", file=sys.stderr)
-        draft = _auto_fix(draft, errors, body_length=body_length)
-        re_errors = validate_post(draft, body_length=body_length)
-        if re_errors:
-            print(f"❌ 扩写后仍不合格: {'; '.join(re_errors)}", file=sys.stderr)
-            return
-
-    draft_path.write_text(json.dumps(draft, ensure_ascii=False, indent=2), encoding="utf-8")
-    _sync_to_obsidian(draft, draft_path.parent.name)
-    print(f"✅ 已扩写完成: {draft_path}", file=sys.stderr)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1571,42 +882,15 @@ def main():
     p_plan.add_argument("--posts", "-p", help="指定 post_id（逗号分隔，如 01,02,03）")
     p_plan.add_argument("--count", "-n", type=int, help="自动选前N个planned帖子")
     p_plan.add_argument("--all", action="store_true", help="跨所有topic自动选")
-    p_plan.add_argument("--mode", "-m", choices=["practical", "news", "story", "longread"], default="practical",
-                        help="内容模式: practical(实操干货) | news(资讯解读) | story(故事) | longread(长文)")
-    p_plan.add_argument(
-        "--type",
-        choices=POST_TYPE_CHOICES,
-        help="Post type (affects prompt, body length, cover style)",
-    )
-    p_plan.add_argument(
-        "--variants",
-        type=int,
-        default=1,
-        help="Generate N lightweight variants (title+cover+summary) for selection",
-    )
+    p_plan.add_argument("--mode", "-m", choices=["practical", "news"], default="practical",
+                        help="内容模式: practical(实操干货) | news(资讯解读)")
 
     # from-sense
     p_sense = sub.add_parser("from-sense", help="从 Sense 选题建议生成")
     p_sense.add_argument("--input", "-i", help="Sense latest.json 路径")
     p_sense.add_argument("--count", "-n", type=int, help="只生成前N个建议")
-    p_sense.add_argument("--mode", "-m", choices=["practical", "news", "story", "longread"], default="practical",
-                        help="内容模式: practical(实操干货) | news(资讯解读) | story(故事) | longread(长文)")
-    p_sense.add_argument(
-        "--type",
-        choices=POST_TYPE_CHOICES,
-        help="Post type (affects prompt, body length, cover style)",
-    )
-    p_sense.add_argument(
-        "--variants",
-        type=int,
-        default=1,
-        help="Generate N lightweight variants (title+cover+summary) for selection",
-    )
-
-    # expand
-    p_expand = sub.add_parser("expand", help="Expand a selected variant into full content")
-    p_expand.add_argument("--draft", required=True, help="Path to content.json with variants")
-    p_expand.add_argument("--variant", type=int, required=True, help="Variant ID to expand")
+    p_sense.add_argument("--mode", "-m", choices=["practical", "news"], default="practical",
+                        help="内容模式: practical(实操干货) | news(资讯解读)")
 
     args = parser.parse_args()
     if not args.subcommand:
@@ -1620,8 +904,6 @@ def main():
         cmd_from_plan(args)
     elif args.subcommand == "from-sense":
         cmd_from_sense(args)
-    elif args.subcommand == "expand":
-        cmd_expand(args)
 
 
 if __name__ == "__main__":

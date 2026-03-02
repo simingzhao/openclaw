@@ -25,6 +25,7 @@ sys.path.insert(0, SCRIPT_DIR)
 
 from content_gen import generate_content, load_digest, load_latest_digest
 from card_gen import generate_cards
+from de_ai import de_ai_content_json
 
 
 def slugify(text: str) -> str:
@@ -178,6 +179,15 @@ def pipeline_daily_brief(args):
     data = generate_content(digest_text, date_str, content_type=args.type)
     print()
 
+    # de-AI 步骤
+    writing_style = getattr(args, "writing_style", None)
+    if not getattr(args, "skip_deai", False):
+        print("=" * 60)
+        print(f"🧹 Step 2.5: 去AI味 (风格: {writing_style or '默认'})")
+        print("=" * 60)
+        data = de_ai_content_json(data, style_id=writing_style)
+        print()
+
     print("=" * 60)
     print("🎨 Step 3: 生成卡片")
     print("=" * 60)
@@ -210,6 +220,12 @@ def pipeline_from_json(args):
     with open(args.input, "r", encoding="utf-8") as f:
         data = json.load(f)
 
+    # de-AI 步骤
+    writing_style = getattr(args, "writing_style", None)
+    if not getattr(args, "skip_deai", False):
+        print(f"🧹 去AI味 (风格: {writing_style or '默认'})")
+        data = de_ai_content_json(data, style_id=writing_style)
+
     out_dir = make_output_dir(get_title_for_dir(data), args.date)
     cards_dir = os.path.join(out_dir, "cards")
     card_paths = generate_cards(style_id=args.style, content_data=data, output_dir=cards_dir)
@@ -235,6 +251,8 @@ def main():
     p_daily.add_argument("--date", "-d", help="日期（MM.DD 或 YYYY-MM-DD）")
     p_daily.add_argument("--style", choices=STYLE_CHOICES, default="typography-card")
     p_daily.add_argument("--type", choices=TYPE_CHOICES, default="brief")
+    p_daily.add_argument("--writing-style", help="写作风格ID（如 闺蜜唠嗑/老司机带路/毒舌测评）")
+    p_daily.add_argument("--skip-deai", action="store_true", help="跳过去AI味步骤")
 
     # from-json
     p_json = sub.add_parser("from-json", help="从已有 content.json 生成卡片")
@@ -242,6 +260,8 @@ def main():
     p_json.add_argument("--date", "-d", help="日期（MM.DD 或 YYYY-MM-DD）")
     p_json.add_argument("--style", choices=STYLE_CHOICES, default="typography-card")
     p_json.add_argument("--type", choices=TYPE_CHOICES, default="brief")
+    p_json.add_argument("--writing-style", help="写作风格ID（如 闺蜜唠嗑/老司机带路/毒舌测评）")
+    p_json.add_argument("--skip-deai", action="store_true", help="跳过去AI味步骤")
 
     args = parser.parse_args()
     if not args.command:

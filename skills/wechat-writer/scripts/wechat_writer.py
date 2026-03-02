@@ -39,7 +39,18 @@ MODELS = {
     "write": {"model": "gemini-3-flash-preview", "thinking": None},
     "review": {"model": "gemini-3-flash-preview", "thinking": None},
     "deai": {"model": "gemini-3-flash-preview", "thinking": None},
+    "cover": {"model": "gemini-3-flash-preview", "thinking": None},
 }
+
+# Cover image generation config
+COVER_IMAGE_MODELS = [
+    "nano-banana-pro-preview",
+    "gemini-3-pro-image-preview",
+    "gemini-2.5-flash-image",
+]
+
+# wechat-blog skill dir (for gen-cover fallback)
+WECHAT_BLOG_SKILL_DIR = Path("/Users/simingzhao/Desktop/openclaw/skills/wechat-blog")
 
 # iCloud sync path
 ICLOUD_ARTICLES_PATH = Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents/OpenClaw_Vault/Articles"
@@ -503,6 +514,21 @@ def stage_write(workdir: Path) -> str:
     for article in source_pack.get("articles", [])[:2]:
         sources_text += f"\n### {article['filename']}\n{article['content'][:1500]}\n"
     
+    # Load local context files from workdir (transcripts, summaries, etc.)
+    # Reads *.txt and *_summary*.md files, up to 200KB total
+    local_context = ""
+    local_context_budget = 200_000  # chars
+    context_files = sorted(workdir.glob("transcript_*.txt")) + sorted(workdir.glob("summary_*.md"))
+    for cf in context_files:
+        remaining = local_context_budget - len(local_context)
+        if remaining <= 0:
+            break
+        content = cf.read_text()[:remaining]
+        local_context += f"\n### {cf.name}\n{content}\n"
+    
+    if local_context:
+        sources_text += f"\n\n## 原始素材（全文 — 优先引用）\n{local_context}"
+    
     prompt = prompt_template.format(
         plan=json.dumps(plan, ensure_ascii=False, indent=2),
         sources=sources_text or "无Scout素材",
@@ -638,6 +664,150 @@ AI文章的典型问题：
     response = call_gemini(prompt, "deai")
     
     return response
+
+
+# ============================================================================
+# Cover Image Generation
+# ============================================================================
+
+def stage_cover(workdir: Path) -> dict:
+    """Generate cover image prompt from article, then generate the image."""
+
+    final_file = workdir / "final.md"
+    if not final_file.exists():
+        print("Error: final.md not found. Run 'deai' first.", file=sys.stderr)
+        sys.exit(1)
+
+    article = final_file.read_text(encoding="utf-8")
+
+    # Extract title (first # or ## line)
+    title = "untitled"
+    for line in article.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            title = stripped.lstrip("#").strip()
+            break
+
+    # --- Step 1: Generate cover prompt via Gemini ---
+    prompt_template = load_prompt("cover")
+    if not prompt_template:
+        print("Error: prompts/cover.md not found.", file=sys.stderr)
+        sys.exit(1)
+
+    # Truncate article to avoid token limits (keep first 4000 chars)
+    article_truncated = article[:4000]
+
+    prompt = prompt_template.format(
+        article=article_truncated,
+        title=title,
+    )
+
+    print("🎨 Generating cover image prompt...", file=sys.stderr)
+    response = call_gemini(prompt, "cover")
+
+    # Parse JSON response
+    json_match = re.search(r'```json\s*(.*?)\s*```', response, re.DOTALL)
+    if json_match:
+        cover_data = json.loads(json_match.group(1))
+    else:
+        try:
+            cover_data = json.loads(response)
+        except json.JSONDecodeError:
+            # Fallback: treat the whole response as a prompt
+            cover_data = {
+                "visual_concept": "auto-generated",
+                "has_text": False,
+                "text_content": "",
+                "prompt": response.strip(),
+            }
+
+    cover_prompt = cover_data.get("prompt", "")
+    if not cover_prompt:
+        print("Error: failed to extract cover prompt from Gemini response.", file=sys.stderr)
+        print(f"Raw response: {response[:500]}", file=sys.stderr)
+        sys.exit(1)
+
+    # Save cover prompt
+    cover_prompt_file = workdir / "cover_prompt.txt"
+    cover_prompt_file.write_text(cover_prompt, encoding="utf-8")
+
+    # Save full cover data
+    cover_data_file = workdir / "cover_data.json"
+    cover_data_file.write_text(json.dumps(cover_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"💡 Visual concept: {cover_data.get('visual_concept', 'N/A')}", file=sys.stderr)
+    print(f"📝 Has text: {cover_data.get('has_text', False)}", file=sys.stderr)
+    print(f"✅ Saved: {cover_prompt_file}", file=sys.stderr)
+
+    # --- Step 2: Generate the actual image ---
+    print("🖼️ Generating cover image with Nano Banana Pro...", file=sys.stderr)
+
+    cover_output = workdir / "cover.png"
+    image_data = None
+    used_model = None
+
+    client = get_client()
+
+    for model in COVER_IMAGE_MODELS:
+        try:
+            print(f"  Trying {model}...", file=sys.stderr)
+            img_response = client.models.generate_content(
+                model=model,
+                contents=cover_prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=["IMAGE", "TEXT"],
+                ),
+            )
+            # Extract image from response parts
+            if img_response.candidates:
+                for part in img_response.candidates[0].content.parts:
+                    if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.mime_type.startswith('image/'):
+                        image_data = part.inline_data.data
+                        used_model = model
+                        break
+            if image_data:
+                break
+        except Exception as e:
+            print(f"  ⚠️ {model} failed: {e}", file=sys.stderr)
+            continue
+
+    if not image_data:
+        print("⚠️ All image models failed. Cover prompt saved — generate manually.", file=sys.stderr)
+        return {
+            "cover_prompt": cover_prompt,
+            "cover_data": cover_data,
+            "image_generated": False,
+        }
+
+    # Save raw image
+    raw_path = workdir / "cover.raw.png"
+    with open(raw_path, 'wb') as f:
+        f.write(image_data)
+
+    # Crop to 900×383 (WeChat cover ratio 2.35:1)
+    try:
+        subprocess.run([
+            'ffmpeg', '-y', '-i', str(raw_path),
+            '-vf', 'scale=900:383:force_original_aspect_ratio=increase,crop=900:383',
+            str(cover_output)
+        ], capture_output=True, check=True)
+        raw_path.unlink(missing_ok=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        import shutil
+        shutil.move(str(raw_path), str(cover_output))
+        print("  ⚠️ ffmpeg unavailable, cover not cropped to 900×383", file=sys.stderr)
+
+    print(f"✅ Cover image: {cover_output} (model: {used_model})", file=sys.stderr)
+
+    result = {
+        "cover_prompt": cover_prompt,
+        "cover_data": cover_data,
+        "image_generated": True,
+        "image_path": str(cover_output),
+        "model": used_model,
+    }
+
+    return result
 
 
 # ============================================================================
@@ -849,6 +1019,18 @@ def cmd_run(args):
     final_file.write_text(final)
     print(f"✅ Saved: {final_file}")
     
+    # COVER
+    print("\n" + "="*60)
+    print("🎨 Stage 6: COVER")
+    print("="*60)
+    cover_result = stage_cover(workdir)
+    cover_data_file = workdir / "cover_data.json"
+    cover_data_file.write_text(json.dumps(cover_result, ensure_ascii=False, indent=2))
+    if cover_result.get("image_generated"):
+        print(f"✅ Cover: {cover_result.get('image_path')}")
+    else:
+        print("⚠️ Cover image not generated — use cover_prompt.txt manually")
+
     # Sync to iCloud
     print("\n" + "="*60)
     print("☁️ Syncing to iCloud Obsidian")
@@ -861,6 +1043,8 @@ def cmd_run(args):
     print(f"\n📁 Local: {workdir}")
     print(f"☁️ iCloud: {icloud_path}")
     print(f"\n👉 Review at: {icloud_path / 'final.md'}")
+    if cover_result.get("image_generated"):
+        print(f"🖼️ Cover at: {cover_result.get('image_path')}")
 
 
 def cmd_single_stage(args, stage_name: str):
@@ -882,6 +1066,13 @@ def cmd_single_stage(args, stage_name: str):
     elif stage_name == "deai":
         result = stage_deai(workdir, getattr(args, 'persona', 'default'))
         (workdir / "final.md").write_text(result)
+    elif stage_name == "cover":
+        result = stage_cover(workdir)
+        (workdir / "cover_data.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
+        if result.get("image_generated"):
+            print(f"🖼️ Cover: {result.get('image_path')}")
+        else:
+            print("⚠️ Cover image not generated — use cover_prompt.txt manually")
     
     print(f"✅ {stage_name} completed")
 
@@ -910,7 +1101,7 @@ def main():
     run_parser.add_argument("--persona", default="default", help="公众号人设配置")
     
     # Single stage commands
-    for stage in ["plan", "research", "write", "review", "deai"]:
+    for stage in ["plan", "research", "write", "review", "deai", "cover"]:
         stage_parser = subparsers.add_parser(stage, help=f"单独执行{stage}阶段")
         stage_parser.add_argument("--workdir", required=True, help="文章工作目录")
         if stage == "plan":

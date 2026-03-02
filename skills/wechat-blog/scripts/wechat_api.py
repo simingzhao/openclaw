@@ -239,8 +239,20 @@ def cmd_draft_add(args: argparse.Namespace) -> None:
             print(f"错误: 文件不存在: {json_path}", file=sys.stderr)
             sys.exit(1)
         
-        with open(json_path, "r") as f:
+        with open(json_path, "r", encoding="utf-8") as f:
             payload = json.load(f)
+
+        # 兼容两种 JSON 结构：
+        # 1) 直接是 {"articles": [...]}（微信官方 draft/add 需要的结构）
+        # 2) 单篇文章 {"title":..., "content":..., "thumb_media_id":...}（历史用法）
+        if isinstance(payload, dict) and "articles" not in payload:
+            required = {"title", "content", "thumb_media_id"}
+            if required.issubset(payload.keys()):
+                payload = {"articles": [payload]}
+
+        # 若传入的是列表，则默认视为 articles 列表
+        if isinstance(payload, list):
+            payload = {"articles": payload}
     else:
         # 从命令行参数构建
         # 支持从 Markdown 文件自动转换
@@ -660,12 +672,11 @@ def cmd_gen_cover(args: argparse.Namespace) -> None:
 
     client = genai.Client(api_key=api_key)
 
-    # Try models: fast+reliable first, premium last (nano-banana can be very slow)
+    # Try models: quality first (nano-banana-pro for best covers)
     models = [
-        "gemini-2.0-flash-exp-image-generation",
-        "gemini-2.5-flash-image",
         "nano-banana-pro-preview",
         "gemini-3-pro-image-preview",
+        "gemini-2.5-flash-image",
     ]
 
     image_data = None

@@ -120,6 +120,65 @@ iCloud 同步目录：
 ~/Library/Mobile Documents/iCloud~md~obsidian/Documents/OpenClaw_Vault/Rednote/
 ```
 
+## 4. 去AI味（de-AI）
+
+```bash
+DEAI="{baseDir}/scripts/de_ai.py"
+
+# 对 content.json 去AI味（默认风格）
+$VENV "$DEAI" -i content.json -o content_deai.json
+
+# 指定写作风格
+$VENV "$DEAI" -i content.json -s 老司机带路
+$VENV "$DEAI" -i content.json -s 闺蜜唠嗑
+$VENV "$DEAI" -i content.json -s 毒舌测评
+$VENV "$DEAI" -i content.json -s 搞钱日记
+$VENV "$DEAI" -i content.json -s 技术翻译官
+$VENV "$DEAI" -i content.json -s 反常识
+
+# 纯文本模式
+echo "正文" | $VENV "$DEAI" --text-only -s 老司机带路
+
+# 查看可用风格
+$VENV "$DEAI" --list-styles
+
+# dry-run（只输出不保存）
+$VENV "$DEAI" -i content.json -s 搞钱日记 --dry-run
+```
+
+de-AI 已集成到 Pipeline（daily-brief / from-json），通过 `--writing-style` 传入：
+
+```bash
+$VENV "$WRITER" daily-brief --source both --writing-style 老司机带路
+$VENV "$WRITER" from-json -i content.json --writing-style 闺蜜唠嗑
+$VENV "$WRITER" daily-brief --source x --skip-deai   # 跳过去AI味
+```
+
+### 写作风格库
+
+风格定义在 `~/.openclaw/workspace-rednote-ops/knowledge/styles/writing-styles.json`
+
+可用风格：
+| ID | 适合场景 |
+|----|---------|
+| 闺蜜唠嗑 | 工具推荐、种草、教程 |
+| 老司机带路 | 避坑指南、实操教程 |
+| 毒舌测评 | 产品测评、对比分析 |
+| 搞钱日记 | 变现案例、副业分享 |
+| 技术翻译官 | 科普、概念解释 |
+| 反常识 | 观点输出、趋势分析 |
+
+风格通过参数注入 Gemini prompt，不写死在代码中。新增风格只需编辑 JSON。
+
+### 本土化
+
+de-AI 模块内置本土化规则（硬编码）：
+
+- WhatsApp/Telegram/Discord → 企微/钉钉/飞书/微信
+- Google Docs/Notion → 腾讯文档/飞书文档/语雀
+- 保留 ChatGPT/Claude/OpenClaw 等AI产品名
+- 货币本土化，不提翻墙
+
 ## 卡片约束
 
 - 渲染引擎：Pillow only（无任何图像 API 调用）

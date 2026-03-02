@@ -62,7 +62,7 @@ def _init():
         sys.exit(1)
 
 
-def call(method: str, params: dict | None = None) -> dict:
+def call(method: str, params: dict | None = None, timeout: int = 120) -> dict:
     """调用 MCP tool。"""
     _init()
     payload = {
@@ -75,12 +75,16 @@ def call(method: str, params: dict | None = None) -> dict:
     if _session_id:
         headers["Mcp-Session-Id"] = _session_id
     try:
-        resp = requests.post(MCP_URL, json=payload, headers=headers, timeout=120)
+        resp = requests.post(MCP_URL, json=payload, headers=headers, timeout=timeout)
         resp.raise_for_status()
+        if resp.status_code == 204 or not resp.content:
+            return {"error": f"MCP返回空 (status={resp.status_code})，操作可能被反爬拦截"}
         data = resp.json()
         if "error" in data:
             return {"error": data["error"]}
         return data.get("result", data)
+    except requests.Timeout:
+        return {"error": f"MCP超时 ({timeout}s)，操作可能被反爬拦截"}
     except requests.ConnectionError:
         return {"error": f"MCP连接断开 ({MCP_URL})"}
     except Exception as e:
@@ -143,15 +147,40 @@ def cmd_publish_draft(args):
     title = data.get("post_title", "")
     content = data.get("post_body", "")
     tags = data.get("tags", [])
-    images = data.get("card_paths", [])
 
-    # 如果 card_paths 里是相对路径，基于 draft 目录解析
+    # 自动拼接 CTA（结尾互动引导）
+    cta = data.get("cta_question", "")
+    if cta and cta not in content:
+        content = content.rstrip() + "\n\n" + cta
+
+    # 图片解析：支持多种字段名 + 自动扫描目录中的 PNG/JPG
     draft_dir = os.path.dirname(os.path.abspath(args.draft))
+    images = (
+        data.get("card_paths")
+        or data.get("images")
+        or data.get("image_paths")
+        or []
+    )
+
+    # 如果 content.json 里没有图片字段，自动扫描同目录下的图片文件
+    if not images:
+        import glob
+        found = sorted(glob.glob(os.path.join(draft_dir, "*.png"))) + \
+                sorted(glob.glob(os.path.join(draft_dir, "*.jpg"))) + \
+                sorted(glob.glob(os.path.join(draft_dir, "*.jpeg")))
+        if found:
+            images = found
+            print(f"   📂 自动发现 {len(images)} 张图片", file=sys.stderr)
+
+    # 相对路径基于 draft 目录解析
     resolved = []
     for img in images:
         if not os.path.isabs(img):
             img = os.path.join(draft_dir, img)
-        resolved.append(img)
+        if os.path.exists(img):
+            resolved.append(img)
+        else:
+            print(f"   ⚠️ 图片不存在，跳过: {img}", file=sys.stderr)
 
     title, content = _validate(title, content)
     params = {"title": title, "content": content, "images": resolved}
@@ -178,7 +207,8 @@ def cmd_search(args):
         if args.note_type:
             filters["note_type"] = args.note_type
         params["filters"] = filters
-    _out(call("search_feeds", params))
+    # 搜索用30秒短超时，快速失败（反爬时MCP会卡60-90秒）
+    _out(call("search_feeds", params, timeout=30))
 
 def cmd_feeds(_args):
     _out(call("list_feeds"))

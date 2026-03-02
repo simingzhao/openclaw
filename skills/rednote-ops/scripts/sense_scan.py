@@ -5,8 +5,9 @@ sense_scan.py — 探子的自动化Sense扫描器
 独立脚本，不走Opus。直接调用：
   - 小红书搜索（rednote_ops MCP）
   - Exa Search API
-  - X API
   - Scout workspace digest（本地文件）
+
+注意：X数据由小黑仔的x-ops独占采集，通过shared-knowledge共享，不在此处重复采集。
 
 然后用 Gemini 做结构化分析，输出 JSON + Markdown 报告。
 
@@ -44,6 +45,20 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
+# ── Shared Knowledge Hub ──
+SHARED_KNOWLEDGE_DIR = Path(os.environ.get(
+    "SHARED_KNOWLEDGE_DIR",
+    os.path.expanduser("~/.openclaw/shared-knowledge"),
+))
+sys.path.insert(0, str(SHARED_KNOWLEDGE_DIR))
+try:
+    from lib.keywords import KeywordManager
+    from lib.index import KnowledgeIndex
+    from lib.topics import TopicTracker
+    HAS_SHARED_KNOWLEDGE = True
+except ImportError:
+    HAS_SHARED_KNOWLEDGE = False
+
 
 # ═══════════════════════════════════════════════════════════════
 # Config
@@ -66,18 +81,10 @@ SCOUT_WORKSPACE = Path(os.environ.get(
 
 EXA_SCRIPT = Path(os.environ.get(
     "EXA_SCRIPT",
-    os.path.expanduser("~/Desktop/openclaw/skills/exa-search/scripts/search.py"),
+    os.path.expanduser("~/Desktop/openclaw/skills/exa-search/scripts/exa_search.py"),
 ))
 
-X_VENV_PYTHON = Path(os.environ.get(
-    "X_VENV_PYTHON",
-    os.path.expanduser("~/Desktop/openclaw/skills/x-api/.venv/bin/python3"),
-))
-
-X_SCRIPT = Path(os.environ.get(
-    "X_SCRIPT",
-    os.path.expanduser("~/Desktop/openclaw/skills/x-api/scripts/x_api.py"),
-))
+# X scanning removed — now handled by x-ops skill via shared-knowledge
 
 # 默认搜索关键词 — 按 strategy.json topics 对齐
 DEFAULT_KEYWORDS_REDNOTE = [
@@ -94,11 +101,7 @@ DEFAULT_KEYWORDS_EXA = [
     "AI one person company",
 ]
 
-DEFAULT_KEYWORDS_X = [
-    "vibe coding -is:retweet lang:en",
-    "AI solopreneur -is:retweet lang:en",
-    "Claude Code -is:retweet lang:en",
-]
+# DEFAULT_KEYWORDS_X removed — x-ops handles X keywords via shared-knowledge
 
 TODAY = datetime.now().strftime("%Y-%m-%d")
 TODAY_DISPLAY = datetime.now().strftime("%m.%d")
@@ -148,7 +151,7 @@ def _mcp_init():
         _mcp_session_id = "__unavailable__"
 
 
-def _mcp_call(method: str, params: dict | None = None) -> dict | None:
+def _mcp_call(method: str, params: dict | None = None, timeout: int = 60) -> dict | None:
     _mcp_init()
     if _mcp_session_id == "__unavailable__":
         return None
@@ -162,38 +165,61 @@ def _mcp_call(method: str, params: dict | None = None) -> dict | None:
     if _mcp_session_id:
         headers["Mcp-Session-Id"] = _mcp_session_id
     try:
-        resp = requests.post(MCP_URL, json=payload, headers=headers, timeout=60)
+        resp = requests.post(MCP_URL, json=payload, headers=headers, timeout=timeout)
         resp.raise_for_status()
+        # MCP返回204表示超时/无内容
+        if resp.status_code == 204 or not resp.content:
+            print(f"⚠️ MCP返回空 ({method}): status={resp.status_code}", file=sys.stderr)
+            return None
         data = resp.json()
         if "error" in data:
             return None
         return data.get("result", data)
+    except requests.Timeout:
+        print(f"⚠️ MCP超时 ({method}): {timeout}s", file=sys.stderr)
+        return None
     except Exception as e:
         print(f"⚠️ MCP调用失败 ({method}): {e}", file=sys.stderr)
         return None
 
 
 def scan_rednote(keywords: list[str]) -> list[dict]:
-    """搜索小红书，返回结构化结果列表。"""
+    """搜索小红书，返回结构化结果列表。搜索失败时自动fallback到推荐流。"""
     print(f"\n🔴 小红书扫描 — {len(keywords)} 个关键词", file=sys.stderr)
     all_results = []
+    search_ok = False
 
-    for kw in keywords:
+    for i, kw in enumerate(keywords):
         print(f"  🔍 搜索: {kw}", file=sys.stderr)
-        # 搜最热（最多点赞）
+        # 搜索用15秒短超时，快速失败
         result = _mcp_call("search_feeds", {
             "keyword": kw,
             "filters": {"sort_by": "最多点赞", "note_type": "图文"},
-        })
+        }, timeout=20)
         if result:
-            # 提取 MCP 返回的内容文本
             items = _extract_mcp_items(result, kw)
             all_results.extend(items)
             print(f"    ✅ 找到 {len(items)} 条", file=sys.stderr)
+            search_ok = True
         else:
-            print(f"    ❌ 无结果", file=sys.stderr)
+            print(f"    ❌ 无结果（可能被反爬）", file=sys.stderr)
+            # 第一个关键词就失败，说明搜索整体挂了，跳过后续关键词
+            if i == 0 and not search_ok:
+                print(f"  ⚠️ 搜索似乎不可用，跳过剩余关键词，尝试推荐流fallback", file=sys.stderr)
+                break
 
         time.sleep(1)  # 避免MCP速率限制
+
+    # 搜索全挂时，fallback到推荐流
+    if not all_results:
+        print(f"  🔄 搜索无结果，fallback到推荐流...", file=sys.stderr)
+        feeds_result = _mcp_call("list_feeds", timeout=30)
+        if feeds_result:
+            items = _extract_mcp_items(feeds_result, "推荐流")
+            all_results.extend(items)
+            print(f"    ✅ 推荐流获取 {len(items)} 条", file=sys.stderr)
+        else:
+            print(f"    ❌ 推荐流也失败了", file=sys.stderr)
 
     return all_results
 
@@ -270,7 +296,7 @@ def scan_exa(keywords: list[str]) -> list[dict]:
         print(f"  🔍 搜索: {kw}", file=sys.stderr)
         try:
             proc = subprocess.run(
-                ["python3", str(EXA_SCRIPT), kw, "--summary", "--json"],
+                ["python3", str(EXA_SCRIPT), kw, "--summary", kw, "--json", "-n", "5"],
                 capture_output=True, text=True, timeout=45,
                 env={**os.environ},
             )
@@ -319,43 +345,8 @@ def scan_exa(keywords: list[str]) -> list[dict]:
     return all_results
 
 
-# ═══════════════════════════════════════════════════════════════
-# X API
-# ═══════════════════════════════════════════════════════════════
-
-def scan_x(keywords: list[str]) -> list[dict]:
-    """调用 X API 脚本搜索。"""
-    print(f"\n🔵 X/Twitter — {len(keywords)} 个关键词", file=sys.stderr)
-    all_results = []
-
-    for kw in keywords:
-        print(f"  🔍 搜索: {kw}", file=sys.stderr)
-        try:
-            proc = subprocess.run(
-                [str(X_VENV_PYTHON), str(X_SCRIPT), "--human", "search", kw, "--max-results", "10"],
-                capture_output=True, text=True, timeout=30,
-                env={**os.environ},
-            )
-            output = proc.stdout.strip()
-            if proc.returncode == 0 and output:
-                all_results.append({
-                    "source": "x",
-                    "keyword": kw,
-                    "raw_text": output[:5000],
-                })
-                print(f"    ✅ 有结果", file=sys.stderr)
-            else:
-                err = proc.stderr.strip()
-                if err:
-                    print(f"    ❌ {err[:200]}", file=sys.stderr)
-                else:
-                    print(f"    ❌ 无结果", file=sys.stderr)
-        except subprocess.TimeoutExpired:
-            print(f"    ⏰ 超时", file=sys.stderr)
-        except Exception as e:
-            print(f"    ❌ 错误: {e}", file=sys.stderr)
-
-    return all_results
+# X API scanning removed — now handled by x-ops skill
+# X data available via shared-knowledge: index.search(query, channel="x")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -367,17 +358,31 @@ def scan_scout() -> list[dict]:
     print(f"\n🐾 Scout Workspace", file=sys.stderr)
     results = []
 
-    # X digest
-    x_digest = SCOUT_WORKSPACE / "raw" / "x-posts" / f"{TODAY}_digest.md"
-    if x_digest.exists():
-        text = x_digest.read_text(encoding="utf-8")[:8000]
-        results.append({
-            "source": "scout-x",
-            "raw_text": text,
-        })
-        print(f"  ✅ X digest: {len(text)} 字", file=sys.stderr)
-    else:
-        print(f"  ⚠️ X digest 不存在: {x_digest}", file=sys.stderr)
+    # X data now via shared-knowledge (x-ops writes to vector index)
+    # Read latest X intel from shared-knowledge if available
+    if HAS_SHARED_KNOWLEDGE:
+        try:
+            _sk_data = SHARED_KNOWLEDGE_DIR / "data"
+            _db_path = _sk_data / "vector-index" / "knowledge.db"
+            if _db_path.exists():
+                from lib.index import KnowledgeIndex
+                _idx = KnowledgeIndex(str(_db_path))
+                x_results = _idx.search("AI trends", channel="x", top_k=10, date_from=TODAY)
+                _idx.close()
+                if x_results:
+                    x_text = "\n\n".join(
+                        f"- @{r.get('metadata',{}).get('author_username','?')}: {r['text'][:300]}"
+                        for r in x_results
+                    )[:8000]
+                    results.append({
+                        "source": "scout-x",
+                        "raw_text": x_text,
+                    })
+                    print(f"  ✅ X data from shared-knowledge: {len(x_results)} chunks", file=sys.stderr)
+                else:
+                    print(f"  ⚠️ shared-knowledge无今日X数据", file=sys.stderr)
+        except Exception as e:
+            print(f"  ⚠️ shared-knowledge X读取失败: {e}", file=sys.stderr)
 
     # YouTube summaries
     yt_dir = SCOUT_WORKSPACE / "raw" / "youtube"
@@ -524,11 +529,40 @@ def analyze_with_gemini(raw_data: list[dict]) -> dict | None:
         print(f"⚠️ 素材过长 ({len(combined_material)}字)，截断至 {MAX_MATERIAL}", file=sys.stderr)
         combined_material = combined_material[:MAX_MATERIAL]
 
+    # 附加关键词提取指令
+    kw_extraction_prompt = ""
+    if HAS_SHARED_KNOWLEDGE:
+        _kw_path = SHARED_KNOWLEDGE_DIR / "data" / "keywords.json"
+        if _kw_path.exists():
+            try:
+                _km_for_prompt = KeywordManager(str(_kw_path))
+                existing_rn = ", ".join(_km_for_prompt.get("rednote"))
+                existing_exa = ", ".join(_km_for_prompt.get("exa"))
+                kw_extraction_prompt = (
+                    f"\n\n## 额外任务：提取新兴关键词\n"
+                    f"当前小红书词库: {existing_rn}\n"
+                    f"当前Exa词库: {existing_exa}\n\n"
+                    f"请在JSON输出中额外添加一个 \"new_keywords\" 字段：\n"
+                    f'{{"new_keywords": {{\n'
+                    f'  "rednote": ["中文新词1", "中文新词2", ...],\n'
+                    f'  "exa": ["english new term 1", "english new term 2", ...]\n'
+                    f'}}}}\n'
+                    f"要求：\n"
+                    f"- 每个渠道3-5个新词\n"
+                    f"- 必须是当前词库中**没有的**\n"
+                    f"- 在扫描结果中出现频率高或增长趋势明显\n"
+                    f"- 与赛道(跨境电商/Vibe Coding/外贸/猎头/AI赚钱)相关\n"
+                    f"- 小红书给中文词，Exa给英文词"
+                )
+            except Exception:
+                pass
+
     user_prompt = (
         f"今天日期：{TODAY}\n"
         f"扫描时间：{datetime.now().strftime('%H:%M')} PST\n\n"
         f"以下是多源扫描的原始数据，请分析并产出结构化Sense报告：\n\n"
         f"{combined_material}\n\n"
+        f"{kw_extraction_prompt}\n\n"
         f"严格按系统提示的JSON格式输出。确保JSON完整可解析。"
     )
 
@@ -631,6 +665,98 @@ def save_outputs(raw_data: list[dict], analysis: dict | None, output_dir: Path):
             json.dump(analysis, f, ensure_ascii=False, indent=2)
         print(f"📁 Latest: {latest_path}", file=sys.stderr)
 
+    # 6. 同步到 shared-knowledge/data/raw/ (按channel分目录)
+    _sync_raw_to_shared_knowledge(raw_data, analysis, timestamp)
+
+
+def _sync_raw_to_shared_knowledge(raw_data: list[dict], analysis: dict | None, timestamp: str):
+    """将raw数据按channel拆分写入 shared-knowledge/data/raw/"""
+    sk_raw = Path(os.path.expanduser("~/.openclaw/shared-knowledge/data/raw"))
+    sk_digest = Path(os.path.expanduser("~/.openclaw/shared-knowledge/data/digest"))
+
+    for item in raw_data:
+        src = item.get("source", "")
+        if src == "rednote":
+            keyword = item.get("keyword", "unknown")
+            feeds = item.get("feeds", [])
+            if not feeds:
+                continue
+            out_items = []
+            for feed in feeds:
+                out_items.append({
+                    "keyword": keyword,
+                    "title": feed.get("title") or feed.get("display_title", ""),
+                    "author": feed.get("author", ""),
+                    "likes": feed.get("likes", 0),
+                    "collects": feed.get("collects", 0),
+                    "comments": feed.get("comments", 0),
+                    "shares": feed.get("shares", 0),
+                    "type": feed.get("type", ""),
+                    "feed_id": feed.get("feed_id", ""),
+                    "xsec_token": feed.get("xsec_token", ""),
+                    "scan_date": TODAY,
+                    "scan_time": timestamp,
+                })
+            out_dir = sk_raw / "rednote" / TODAY
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_file = out_dir / f"{TODAY}_{timestamp}_raw.json"
+            # 追加模式：如果文件已存在，合并
+            existing = []
+            if out_file.exists():
+                try:
+                    existing = json.loads(out_file.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            existing.extend(out_items)
+            out_file.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        elif src == "exa":
+            keyword = item.get("keyword", "unknown")
+            articles = item.get("articles", [])
+            if not articles:
+                continue
+            out_items = []
+            for article in articles:
+                out_items.append({
+                    "keyword": keyword,
+                    "title": article.get("title", ""),
+                    "url": article.get("url", ""),
+                    "date": article.get("date", ""),
+                    "snippet": article.get("snippet", ""),
+                    "scan_date": TODAY,
+                    "scan_time": timestamp,
+                })
+            out_dir = sk_raw / "exa" / TODAY
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_file = out_dir / f"{TODAY}_{timestamp}_raw.json"
+            existing = []
+            if out_file.exists():
+                try:
+                    existing = json.loads(out_file.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            existing.extend(out_items)
+            out_file.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # 分析报告写入digest/scans/
+    if analysis:
+        scans_dir = sk_digest / "scans"
+        scans_dir.mkdir(parents=True, exist_ok=True)
+        report_path = scans_dir / f"{TODAY}_{timestamp}_report.md"
+        if not report_path.exists():
+            report_path.write_text(_render_markdown(analysis), encoding="utf-8")
+
+        # 趋势日志写入digest/daily/
+        daily_dir = sk_digest / "daily"
+        daily_dir.mkdir(parents=True, exist_ok=True)
+        daily_path = daily_dir / f"{TODAY}.md"
+        md_content = _render_markdown(analysis)
+        mode = "a" if daily_path.exists() else "w"
+        with open(daily_path, mode, encoding="utf-8") as f:
+            if mode == "a":
+                f.write(f"\n\n---\n\n# 补充扫描 ({timestamp})\n\n")
+            f.write(md_content)
+
 
 def _render_markdown(analysis: dict) -> str:
     """将分析 JSON 渲染为可读 Markdown。"""
@@ -723,6 +849,156 @@ def _render_markdown(analysis: dict) -> str:
 # Main
 # ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# Shared Knowledge 回写
+# ═══════════════════════════════════════════════════════════════
+
+def _sync_shared_knowledge(raw_data: list[dict], analysis: dict, km: "KeywordManager | None", sources: set[str]):
+    """分析完成后，回写到共享知识库：关键词进化 + 向量入库 + 话题更新。"""
+    print(f"\n📚 回写 Shared Knowledge...", file=sys.stderr)
+    sk_data = SHARED_KNOWLEDGE_DIR / "data"
+
+    # ── 1. 关键词进化 ──
+    new_keywords = analysis.get("new_keywords", {})
+    if km and new_keywords:
+        for channel_key, words in new_keywords.items():
+            if isinstance(words, list) and words:
+                word_dicts = [{"keyword": w, "source": f"sense:{TODAY}"} for w in words if isinstance(w, str) and w.strip()]
+                if word_dicts:
+                    km.evolve(channel_key, word_dicts)
+                    print(f"  🔑 {channel_key} +{len(word_dicts)} 新词: {', '.join(w['keyword'] for w in word_dicts[:5])}", file=sys.stderr)
+
+        # 记录命中/未命中
+        for item in raw_data:
+            keyword = item.get("keyword", "")
+            if not keyword:
+                continue
+            source = item.get("source", "")
+            channel = "rednote" if source == "rednote" else ("exa" if source == "exa" else "")
+            if not channel:
+                continue
+            has_content = bool(item.get("feeds") or item.get("articles") or item.get("raw_text"))
+            if has_content:
+                km.record_hit(channel, keyword)
+            else:
+                km.record_miss(channel, keyword)
+
+        km.gc()
+        km.save()
+        print(f"  ✅ 关键词词库已更新", file=sys.stderr)
+    elif not new_keywords:
+        print(f"  ⚠️ Gemini未返回new_keywords，跳过关键词进化", file=sys.stderr)
+
+    # ── 2. 向量入库 ──
+    try:
+        db_path = sk_data / "vector-index" / "knowledge.db"
+        index = KnowledgeIndex(str(db_path))
+        chunks_added = 0
+
+        # 小红书帖子
+        for item in raw_data:
+            if item.get("source") != "rednote":
+                continue
+            keyword = item.get("keyword", "")
+            for feed in item.get("feeds", []):
+                title = feed.get("title", "")
+                if not title:
+                    continue
+                text = f"{title} | 作者:{feed.get('author','')} | 赞:{feed.get('likes',0)} 藏:{feed.get('collects',0)}"
+                try:
+                    index.add(
+                        source="sense_scan",
+                        channel="rednote",
+                        date=TODAY,
+                        title=title,
+                        text=text,
+                        metadata={
+                            "keyword": keyword,
+                            "likes": feed.get("likes", "0"),
+                            "collects": feed.get("collects", "0"),
+                            "feed_id": feed.get("feed_id", ""),
+                        },
+                        tags=["rednote-search"],
+                    )
+                    chunks_added += 1
+                except Exception as e:
+                    print(f"  ⚠️ 入库失败: {e}", file=sys.stderr)
+
+        # Exa文章
+        for item in raw_data:
+            if item.get("source") != "exa":
+                continue
+            keyword = item.get("keyword", "")
+            for article in item.get("articles", []):
+                title = article.get("title", "")
+                snippet = article.get("snippet", "")
+                if not (title or snippet):
+                    continue
+                text = f"{title}\n{snippet}" if snippet else title
+                try:
+                    index.add(
+                        source="sense_scan",
+                        channel="exa",
+                        date=article.get("date", TODAY) or TODAY,
+                        title=title,
+                        text=text,
+                        metadata={
+                            "keyword": keyword,
+                            "url": article.get("url", ""),
+                        },
+                        tags=["exa-search"],
+                    )
+                    chunks_added += 1
+                except Exception as e:
+                    print(f"  ⚠️ 入库失败: {e}", file=sys.stderr)
+
+        index.close()
+        print(f"  📦 向量库 +{chunks_added} chunks", file=sys.stderr)
+    except Exception as e:
+        print(f"  ❌ 向量入库失败: {e}", file=sys.stderr)
+
+    # ── 3. 话题追踪 ──
+    try:
+        topics_path = sk_data / "topics.json"
+        tracker = TopicTracker(str(topics_path))
+
+        # 从分析结果的trends提取话题
+        for trend in analysis.get("trends", []):
+            signal = trend.get("signal", "")
+            if not signal:
+                continue
+            # 生成topic_key
+            topic_key = signal.lower().replace(" ", "-").replace("，", "-").replace("：", "-")[:40]
+            topic_key = "".join(c for c in topic_key if c.isalnum() or c == "-")
+
+            # 判断渠道
+            trend_sources = trend.get("sources", [])
+            for src in trend_sources:
+                channel = ""
+                if "rednote" in src.lower() or "小红书" in src.lower():
+                    channel = "rednote"
+                elif "exa" in src.lower():
+                    channel = "exa"
+                elif "scout" in src.lower() or "x" in src.lower() or "twitter" in src.lower():
+                    channel = "x"
+                elif "youtube" in src.lower() or "yt" in src.lower():
+                    channel = "youtube"
+                if channel:
+                    tracker.upsert(topic_key, channel, {
+                        "display_name": signal,
+                        "mentions": 1,
+                        "last_seen": TODAY,
+                        "related_track": trend.get("topic_match", ""),
+                    })
+
+        tracker.save()
+        all_topics = tracker.data.get("topics", {})
+        active_count = sum(1 for t in all_topics.values() if t.get("status") == "active")
+        print(f"  📋 话题追踪: {len(all_topics)} 总计, {active_count} active", file=sys.stderr)
+    except Exception as e:
+        print(f"  ❌ 话题追踪失败: {e}", file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="探子 Sense 扫描器 — 多源信息采集 + Gemini分析",
@@ -730,7 +1006,7 @@ def main():
     )
     parser.add_argument(
         "--sources", default="all",
-        help="数据源（逗号分隔）：rednote,exa,x,scout,all（默认all）",
+        help="数据源（逗号分隔）：rednote,exa,scout,all（默认all）。X已移至x-ops。",
     )
     parser.add_argument(
         "--keywords", default="",
@@ -740,10 +1016,7 @@ def main():
         "--keywords-exa", default="",
         help="自定义Exa关键词（逗号分隔）",
     )
-    parser.add_argument(
-        "--keywords-x", default="",
-        help="自定义X关键词（逗号分隔）",
-    )
+    # --keywords-x removed: X scanning now handled by x-ops skill
     parser.add_argument(
         "--skip-analysis", action="store_true",
         help="只拉数据，不调Gemini分析",
@@ -762,14 +1035,36 @@ def main():
     # 解析 sources
     sources = set()
     if args.sources == "all":
-        sources = {"rednote", "exa", "x", "scout"}
+        sources = {"rednote", "exa", "scout"}
     else:
         sources = {s.strip() for s in args.sources.split(",")}
 
-    # 解析关键词
-    kw_rednote = [k.strip() for k in args.keywords.split(",") if k.strip()] if args.keywords else DEFAULT_KEYWORDS_REDNOTE
-    kw_exa = [k.strip() for k in args.keywords_exa.split(",") if k.strip()] if args.keywords_exa else DEFAULT_KEYWORDS_EXA
-    kw_x = [k.strip() for k in args.keywords_x.split(",") if k.strip()] if args.keywords_x else DEFAULT_KEYWORDS_X
+    # 解析关键词 — 优先从 shared-knowledge 动态词库读取
+    _km = None
+    if HAS_SHARED_KNOWLEDGE and not args.keywords and not args.keywords_exa:
+        _kw_path = SHARED_KNOWLEDGE_DIR / "data" / "keywords.json"
+        if _kw_path.exists():
+            try:
+                _km = KeywordManager(str(_kw_path))
+                print(f"📚 使用 shared-knowledge 动态词库: {_kw_path}", file=sys.stderr)
+            except Exception as e:
+                print(f"⚠️ 读取动态词库失败: {e}，使用默认关键词", file=sys.stderr)
+
+    if args.keywords:
+        kw_rednote = [k.strip() for k in args.keywords.split(",") if k.strip()]
+    elif _km:
+        kw_rednote = _km.get("rednote")
+        print(f"  🔴 rednote 关键词 ({len(kw_rednote)}): {', '.join(kw_rednote[:8])}{'...' if len(kw_rednote) > 8 else ''}", file=sys.stderr)
+    else:
+        kw_rednote = DEFAULT_KEYWORDS_REDNOTE
+
+    if args.keywords_exa:
+        kw_exa = [k.strip() for k in args.keywords_exa.split(",") if k.strip()]
+    elif _km:
+        kw_exa = _km.get("exa")
+        print(f"  🟢 exa 关键词 ({len(kw_exa)}): {', '.join(kw_exa[:5])}{'...' if len(kw_exa) > 5 else ''}", file=sys.stderr)
+    else:
+        kw_exa = DEFAULT_KEYWORDS_EXA
 
     output_dir = Path(args.output) if args.output else WORKSPACE / "sense"
 
@@ -790,9 +1085,6 @@ def main():
     if "exa" in sources:
         all_raw.extend(scan_exa(kw_exa))
 
-    if "x" in sources:
-        all_raw.extend(scan_x(kw_x))
-
     if not all_raw:
         print("\n❌ 所有信源均无数据", file=sys.stderr)
         sys.exit(1)
@@ -810,6 +1102,10 @@ def main():
                 print(json.dumps(analysis, ensure_ascii=False, indent=2))
         else:
             print(f"\n⚠️ 分析失败，仅保存原始数据", file=sys.stderr)
+
+    # ── Shared Knowledge 回写 ──
+    if HAS_SHARED_KNOWLEDGE and analysis:
+        _sync_shared_knowledge(all_raw, analysis, _km, sources)
 
     # ── 保存 ──
     save_outputs(all_raw, analysis, output_dir)

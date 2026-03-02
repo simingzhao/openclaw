@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Scout YouTube Patrol v6 - yt-dlp powered
+Scout YouTube Patrol v7 - yt-dlp powered + shared-knowledge integration
 - yt-dlp for subtitles, channel scanning, and metadata (no YouTube Data API quota)
 - State separated from config (yt-patrol-state.json)
 - Channel quality metrics tracking
 - maintain / health / remove-channel commands
 - --json output for all patrol commands
+- Shared Knowledge Hub: vector indexing + topic tracking after patrol
 """
 
 import argparse
@@ -20,12 +21,29 @@ from pathlib import Path
 
 import yaml
 
+# ── Shared Knowledge Hub ──────────────────────────────────────────
+SHARED_KNOWLEDGE_DIR = Path(os.environ.get(
+    "SHARED_KNOWLEDGE_DIR",
+    os.path.expanduser("~/.openclaw/shared-knowledge"),
+))
+sys.path.insert(0, str(SHARED_KNOWLEDGE_DIR))
+try:
+    from lib.keywords import KeywordManager
+    from lib.index import KnowledgeIndex
+    from lib.topics import TopicTracker
+    HAS_SHARED_KNOWLEDGE = True
+except ImportError:
+    HAS_SHARED_KNOWLEDGE = False
+
 # ── paths / thresholds ──────────────────────────────────────────
 WORKSPACE       = Path(os.environ.get("SCOUT_YT_WORKSPACE", os.path.expanduser("~/.openclaw/workspace")))
+SHARED_KNOWLEDGE_DATA = Path(
+    os.environ.get("SHARED_KNOWLEDGE_DATA_DIR", os.path.expanduser("~/.openclaw/shared-knowledge/data"))
+)
 WATCHLIST_PATH  = WORKSPACE / "sources" / "yt-watchlist.yaml"
 STATE_PATH      = WORKSPACE / "sources" / "yt-patrol-state.json"
 METRICS_PATH    = WORKSPACE / "sources" / "yt-watchlist-metrics.json"
-RAW_DIR         = WORKSPACE / "raw" / "youtube"
+RAW_DIR         = SHARED_KNOWLEDGE_DATA / "raw" / "youtube"
 
 LONG_VIDEO_THRESHOLD = 2700   # 45 min → map-reduce
 CHUNK_SIZE           = 20000  # ~20 KB per chunk
@@ -531,6 +549,18 @@ def process_video(video: dict, channel_slug: str, processed_set: set) -> dict:
     summary_dir.mkdir(parents=True, exist_ok=True)
 
     title_slug = slugify(video_title)[:50]
+
+    # File-level dedup: if any existing summary contains this video URL, skip
+    if summary_dir.exists():
+        for existing in summary_dir.glob("*.md"):
+            try:
+                head = existing.read_text(encoding="utf-8")[:500]
+                if video_id in head:
+                    result['error'] = 'Already processed (file exists)'
+                    return result
+            except Exception:
+                pass
+
     transcript_file = transcript_dir / f"{date_str}_{title_slug}.txt"
     summary_file    = summary_dir    / f"{date_str}_{title_slug}.md"
 
@@ -707,7 +737,7 @@ def cmd_patrol(args, config):
                 print(f"  Exception processing {v['title']}: {e}", flush=True)
 
     # save state (not config)
-    state['processed_videos'] = list(processed)[-100:]
+    state['processed_videos'] = list(processed)[-500:]
     state['last_run'] = datetime.now().isoformat()
     save_state(state)
     save_metrics(metrics)
@@ -761,7 +791,140 @@ def cmd_patrol(args, config):
         }
         print(json.dumps(summary, ensure_ascii=False, indent=2))
 
+    # ── Shared Knowledge sync ──
+    _sync_shared_knowledge(results)
+
     return results
+
+
+# ═══════════════════════════════════════════════════════════════
+# Shared Knowledge 回写
+# ═══════════════════════════════════════════════════════════════
+
+def _sync_shared_knowledge(results: list[dict]) -> None:
+    """巡逻完成后，把成功的视频摘要写入shared-knowledge。"""
+    if not HAS_SHARED_KNOWLEDGE:
+        return
+
+    successful = [r for r in results if r.get('success') and r.get('summary_preview')]
+    if not successful:
+        return
+
+    print("\n📚 Syncing to Shared Knowledge...", flush=True)
+    sk_data = SHARED_KNOWLEDGE_DIR / "data"
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # ── 1. 向量入库 ──
+    try:
+        db_path = sk_data / "vector-index" / "knowledge.db"
+        index = KnowledgeIndex(str(db_path))
+        added = 0
+
+        for r in successful:
+            title = r.get('title', '')
+            channel = r.get('channel', 'unknown')
+            video_id = r.get('id', '')
+            url = r.get('url', f"https://www.youtube.com/watch?v={video_id}")
+
+            # 读取完整摘要文件（如果存在）
+            summary_text = r.get('summary_preview', '')
+            summary_file = r.get('file')
+            if summary_file and Path(summary_file).exists():
+                full_text = Path(summary_file).read_text(encoding='utf-8')
+                # 去掉header（---之前的部分）
+                if '---' in full_text:
+                    parts = full_text.split('---', 2)
+                    if len(parts) >= 3:
+                        summary_text = parts[2].strip()
+                    else:
+                        summary_text = full_text
+                else:
+                    summary_text = full_text
+
+            # 按段落分chunk入库（每chunk ~2000字）
+            chunks = _split_summary_chunks(summary_text, max_size=2000)
+            for i, chunk in enumerate(chunks):
+                if len(chunk.strip()) < 50:
+                    continue
+                chunk_title = f"{title} [{i+1}/{len(chunks)}]" if len(chunks) > 1 else title
+                try:
+                    index.add(
+                        source="scout_yt",
+                        channel="youtube",
+                        date=today,
+                        title=chunk_title,
+                        text=chunk,
+                        metadata={
+                            "video_id": video_id,
+                            "url": url,
+                            "channel_slug": channel,
+                            "chunk_index": i,
+                        },
+                        tags=["youtube", f"yt-{channel}"],
+                    )
+                    added += 1
+                except Exception as e:
+                    print(f"  ⚠️ Index add failed: {e}", file=sys.stderr)
+
+        index.close()
+        print(f"  📦 Indexed {added} chunks from {len(successful)} videos", flush=True)
+    except Exception as e:
+        print(f"  ❌ Vector indexing failed: {e}", file=sys.stderr)
+
+    # ── 2. 话题追踪 ──
+    try:
+        tracker = TopicTracker(str(sk_data / "topics.json"))
+
+        for r in successful:
+            title = r.get('title', '')
+            channel = r.get('channel', 'unknown')
+            # 用视频标题生成topic key
+            topic_key = _video_title_to_topic(title)
+            if topic_key:
+                tracker.upsert(topic_key, "youtube", {
+                    "display_name": title[:60],
+                    "mentions": 1,
+                    "last_seen": today,
+                    "channel_slug": channel,
+                })
+
+        tracker.save()
+        print(f"  📋 Topics updated for {len(successful)} videos", flush=True)
+    except Exception as e:
+        print(f"  ❌ Topic tracking failed: {e}", file=sys.stderr)
+
+
+def _split_summary_chunks(text: str, max_size: int = 2000) -> list[str]:
+    """按段落边界分chunk，每个不超过max_size字。"""
+    if len(text) <= max_size:
+        return [text]
+
+    paragraphs = text.split('\n\n')
+    chunks = []
+    current = []
+    current_len = 0
+
+    for para in paragraphs:
+        para_len = len(para) + 2  # +2 for \n\n
+        if current_len + para_len > max_size and current:
+            chunks.append('\n\n'.join(current))
+            current = []
+            current_len = 0
+        current.append(para)
+        current_len += para_len
+
+    if current:
+        chunks.append('\n\n'.join(current))
+
+    return chunks
+
+
+def _video_title_to_topic(title: str) -> str:
+    """从视频标题生成简短的topic key。"""
+    # 去掉特殊字符，保留英文/中文/数字
+    cleaned = re.sub(r'[^\w\u4e00-\u9fff\s-]', '', title.lower())
+    cleaned = re.sub(r'\s+', '-', cleaned.strip())
+    return cleaned[:50] if cleaned else ""
 
 
 # ── process command ──────────────────────────────────────────────
